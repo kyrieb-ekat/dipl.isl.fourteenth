@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Read(//Users/ekaterina/Desktop/Charters/pdfs/**)",
+      "Bash(conda --version)",
+      "Bash(conda create *)",
+      "Bash(conda run *)",
+      "Bash(conda env *)"
+    ]
+  }
+}
