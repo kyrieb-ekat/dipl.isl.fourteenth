@@ -247,12 +247,27 @@ with tab_pipeline:
     # ── Step 3 ───────────────────────────────────────────────────────────────
     s3_key = f"s3_{vol}"
     with st.expander(step_label("Step 3 — Resolve entities against authority files", s3_key)):
-        st.caption(
-            "Fuzzy-matches names against the authority. "
-            "Scores >=85 are auto-assigned; 60-84 go to the review queue; <60 become new entities."
-        )
-        if st.button("Run", key="btn_s3", disabled=is_running(s3_key)):
-            run_command([PYTHON, "03_resolve_entities.py", "--vol", str(vn)], s3_key)
+        col_fa, col_fr = st.columns(2)
+        with col_fa:
+            s3_accept = st.slider(
+                "Auto-assign threshold",
+                min_value=1, max_value=100, value=85,
+                key="s3_accept",
+                help="Scores at or above this are automatically assigned an existing authority ID.",
+            )
+        with col_fr:
+            s3_review = st.slider(
+                "Review threshold",
+                min_value=1, max_value=100, value=60,
+                key="s3_review",
+                help="Scores between this and the auto-assign threshold go to the review queue. Below this becomes a new entity.",
+            )
+        if s3_review >= s3_accept:
+            st.warning("Review threshold must be lower than the auto-assign threshold.")
+        cmd3 = [PYTHON, "03_resolve_entities.py", "--vol", str(vn),
+                "--fuzzy-accept", str(s3_accept), "--fuzzy-review", str(s3_review)]
+        if st.button("Run", key="btn_s3", disabled=is_running(s3_key) or s3_review >= s3_accept):
+            run_command(cmd3, s3_key)
             st.rerun()
         if step_output(s3_key):
             any_running = True

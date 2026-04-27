@@ -75,6 +75,8 @@ def resolve_persons(
     persons_df: pd.DataFrame,
     persons_lookup: dict,
     existing_ids: list[str],
+    fuzzy_accept: int = FUZZY_ACCEPT,
+    fuzzy_review: int = FUZZY_REVIEW,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """
     Returns:
@@ -92,9 +94,9 @@ def resolve_persons(
 
         matched_id, score, canonical = fuzzy_match(name, persons_lookup, persons_df)
 
-        if score >= FUZZY_ACCEPT:
+        if score >= fuzzy_accept:
             resolved.append({**p, "person_id": matched_id, "match_score": score, "matched_canonical": canonical})
-        elif score >= FUZZY_REVIEW:
+        elif score >= fuzzy_review:
             review_items.append({
                 "type": "person", "extracted_name": name,
                 "closest_match": canonical, "match_id": matched_id, "score": score,
@@ -135,6 +137,8 @@ def resolve_places(
     places_lookup: dict,
     existing_ids: list[str],
     place_auth: PlaceAuthority | None = None,
+    fuzzy_accept: int = FUZZY_ACCEPT,
+    fuzzy_review: int = FUZZY_REVIEW,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     resolved, new_places, review_items = [], [], []
     seen_new: dict[str, str] = {}
@@ -149,10 +153,10 @@ def resolve_places(
                         "matched_canonical": entry.canonical_name}, None, None
 
         matched_id, score, canonical = fuzzy_match(name, places_lookup, places_df)
-        if score >= FUZZY_ACCEPT:
+        if score >= fuzzy_accept:
             return {"name": name, "role": role, "region": region,
                     "place_id": matched_id, "match_score": score, "matched_canonical": canonical}, None, None
-        elif score >= FUZZY_REVIEW:
+        elif score >= fuzzy_review:
             review = {"type": "place", "extracted_name": name,
                       "closest_match": canonical, "match_id": matched_id, "score": score, "role": role}
             return {"name": name, "role": role, "region": region,
@@ -201,7 +205,13 @@ def resolve_places(
 def main():
     parser = argparse.ArgumentParser(description="Resolve entities against authority files.")
     parser.add_argument("--vol", type=int, required=True)
+    parser.add_argument("--fuzzy-accept", type=int, default=FUZZY_ACCEPT,
+                        help=f"Min score to auto-assign an existing ID (default: {FUZZY_ACCEPT})")
+    parser.add_argument("--fuzzy-review", type=int, default=FUZZY_REVIEW,
+                        help=f"Min score to flag for manual review (default: {FUZZY_REVIEW})")
     args = parser.parse_args()
+    fa, fr = args.fuzzy_accept, args.fuzzy_review
+    print(f"Thresholds: auto-assign >= {fa}, review >= {fr}, new < {fr}")
 
     raw_path = ENTITIES_DIR / f"vol{args.vol:02d}_raw_entities.json"
     if not raw_path.exists():
@@ -236,11 +246,13 @@ def main():
         running_place_ids  = existing_place_ids  + [p["place_id"]  for p in all_new_places]
 
         res_persons, new_p, rev_p = resolve_persons(
-            ch.get("persons", []), persons_df, persons_lookup, running_person_ids
+            ch.get("persons", []), persons_df, persons_lookup, running_person_ids,
+            fuzzy_accept=fa, fuzzy_review=fr,
         )
         res_places, new_l, rev_l = resolve_places(
             ch.get("locations", []), ch.get("all_places_mentioned", []),
-            places_df, places_lookup, running_place_ids, place_auth
+            places_df, places_lookup, running_place_ids, place_auth,
+            fuzzy_accept=fa, fuzzy_review=fr,
         )
 
         # Add charter source reference to new entries
