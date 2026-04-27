@@ -97,7 +97,7 @@ The `--annotate` flag adds three columns to the CSV without changing any data:
 | `proposed_wikidata_id` | Authority Wikidata QID that would be assigned |
 | `review_status` | Blank for matched rows; `no_match` for unmatched |
 
-**Open the CSV in a spreadsheet and fill in `review_status` for each row:**
+**Open the CSV in a spreadsheet (or the review app's New Entities > Places tab) and fill in `review_status` for each row:**
 
 | Value | Effect when applied |
 |-------|-------------------|
@@ -142,7 +142,42 @@ Reads `output/entities/vol04_resolved_entities.json` and writes four CSVs to `ou
 - `vol04_places_new.csv` — candidate new places to add to the authority
 - `vol04_review_queue.csv` — ambiguous fuzzy matches (score 60–84) for manual inspection
 
-**Review these files before proceeding.** For `persons_new.csv`, fill in `review_status` per row using the same values as 4b (`ok`, `skip`, `add`).
+**Review these files before proceeding** using the review app (see below) or manually in a spreadsheet.
+
+---
+
+### Review app
+
+The review app provides a browser UI for working through the outputs of Step 5. Launch it from the `charter_pipeline/` directory:
+
+```bash
+conda activate dic
+streamlit run review_app.py
+# opens at http://localhost:8501
+```
+
+The app has three tabs:
+
+**Review Queue** — lists all fuzzy matches (score 60–84) from `vol_review_queue.csv`. Set **Decision** for each row:
+
+| Value | Effect |
+|-------|--------|
+| `accept` | Use the proposed authority ID |
+| `reject` | Treat as a new entity (will get a fresh ID) |
+
+**New Entities** — sub-tabs for Persons and Places. Inline-edit canonical names, Wikidata IDs, coordinates, and other fields. Set **Status** per row:
+
+| Value | Effect |
+|-------|--------|
+| `ok` | Include in charter data |
+| `skip` | Exclude entirely |
+| `add` | Include AND promote to the authority file |
+
+Wikidata IDs entered here become clickable links so you can verify them without leaving the app.
+
+**Authority Browser** — searchable read-only view of both authority CSVs, useful as a reference while triaging.
+
+All edits auto-save to the underlying CSVs immediately. The sidebar volume selector auto-detects whatever volumes have been processed, so switching between volumes requires no configuration.
 
 ---
 
@@ -209,7 +244,8 @@ python3 04b_propagate_corrections.py --csv output/review/vol04_places_new_geocod
 python3 04b_propagate_corrections.py --csv output/review/vol04_places_new_geocoded.csv
 python3 04c_add_to_authority.py --csv output/review/vol04_places_new_geocoded.csv
 python3 05_export_csvs.py --vol 4
-# → review persons_new.csv and charters.csv, fill in review_status / resolve REVIEW: prefixes
+# → open the review app (streamlit run review_app.py) to triage review_queue.csv,
+#   persons_new.csv, and places_new.csv; then resolve any REVIEW: prefixes in charters.csv
 python3 05b_rescan_flags.py --vol 4
 python3 04d_add_to_person_authority.py --csv output/review/vol04_persons_new.csv
 python3 06_merge_into_xlsx.py --vol 4
