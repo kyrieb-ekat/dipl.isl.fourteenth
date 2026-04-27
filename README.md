@@ -148,7 +148,7 @@ Reads `output/entities/vol04_resolved_entities.json` and writes four CSVs to `ou
 
 ### Review app
 
-The review app provides a browser UI for working through the outputs of Step 5. Launch it from the `charter_pipeline/` directory:
+`review_app.py` is an optional browser dashboard that covers the entire pipeline end-to-end. Launch it from the `charter_pipeline/` directory:
 
 ```bash
 conda activate dic
@@ -156,7 +156,9 @@ streamlit run review_app.py
 # opens at http://localhost:8501
 ```
 
-The app has three tabs:
+The app has four tabs:
+
+**Pipeline** — run every step directly from the browser. Each step is a collapsible section with a Run (or Dry run / Apply) button, a live log that streams output as it runs, and a status label in the header. Step 2 supports optional batch ranges. Steps 4b, 4c, 4d, and 6 show both a dry-run and an apply button side by side. After Step 5 completes, a prompt appears to switch to the review tabs before continuing. The expander labels update to show `(running...)`, `(done)`, or `(error)` in real time.
 
 **Review Queue** — lists all fuzzy matches (score 60–84) from `vol_review_queue.csv`. Set **Decision** for each row:
 
@@ -229,6 +231,8 @@ Also writes `output/review/vol04_nodegoat_export.csv` — a flattened CSV for im
 
 ### Full run sequence (reference)
 
+The easiest way to run the full sequence is through the **Pipeline tab** in the review app (`streamlit run review_app.py`). For CLI-only workflows:
+
 ```bash
 # One-time (per machine)
 python3 seed_place_names.py
@@ -240,12 +244,12 @@ python3 02_extract_entities.py --vol 4 --start 1 --end 100   # repeat for more b
 python3 03_resolve_entities.py --vol 4
 python3 04_lookup_coords.py --vol 4
 python3 04b_propagate_corrections.py --csv output/review/vol04_places_new_geocoded.csv --annotate
-# → review CSV, fill in review_status
+# → review CSV (or use New Entities > Places tab), fill in review_status
 python3 04b_propagate_corrections.py --csv output/review/vol04_places_new_geocoded.csv
 python3 04c_add_to_authority.py --csv output/review/vol04_places_new_geocoded.csv
 python3 05_export_csvs.py --vol 4
-# → open the review app (streamlit run review_app.py) to triage review_queue.csv,
-#   persons_new.csv, and places_new.csv; then resolve any REVIEW: prefixes in charters.csv
+# → triage review_queue.csv, persons_new.csv, places_new.csv (Review Queue / New Entities tabs)
+#   then resolve any REVIEW: prefixes in charters.csv
 python3 05b_rescan_flags.py --vol 4
 python3 04d_add_to_person_authority.py --csv output/review/vol04_persons_new.csv
 python3 06_merge_into_xlsx.py --vol 4
