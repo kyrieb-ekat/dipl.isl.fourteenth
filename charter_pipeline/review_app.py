@@ -27,7 +27,7 @@ def load_csv(path: Path, add_cols: dict | None = None) -> pd.DataFrame:
     """Read CSV as strings; insert any missing columns with their default values."""
     if not path.exists():
         return pd.DataFrame()
-    df = pd.read_csv(path, dtype=str).fillna("")
+    df = pd.read_csv(path, dtype=str, on_bad_lines="warn").fillna("")
     if add_cols:
         for col, default in add_cols.items():
             if col not in df.columns:
@@ -114,8 +114,6 @@ def step_label(base: str, *keys: str) -> str:
         return base + "  (running...)"
     if "error" in statuses:
         return base + "  (error)"
-    if statuses and all(s == "done" for s in statuses if s):
-        return base + "  (done)"
     return base
 
 
