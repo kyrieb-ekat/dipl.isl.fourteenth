@@ -1,0 +1,5 @@
+quarter,constituent_sysslur,confidence,note
+Norðlendingafjórðungur,"Vestur-Húnavatnssýsla;Austur-Húnavatnssýsla;Skagafjarðarsýsla;Eyjafjarðarsýsla;Suður-Þingeyjarsýsla;Norður-Þingeyjarsýsla",medium,"Northern Quarter - roughly coterminous with the Hólar diocese, see dioceses.csv"
+Sunnlendingafjórðungur,"Árnessýsla;Rangárvallasýsla;Vestur-Skaftafellssýsla;Gullbringusýsla;Kjósarsýsla",medium,"Southern Quarter - Gullbringu/Kjósar placement sometimes treated separately from the four core sýslur, verify"
+Vestfirðingafjórðungur,"Borgarfjarðarsýsla;Mýrasýsla;Snæfellsnessýsla;Dalasýsla;Vestur-Barðastrandarsýsla;Austur-Barðastrandarsýsla;Vestur-Ísafjarðarsýsla;Norður-Ísafjarðarsýsla;Strandasýsla",low,"Western Quarter - Strandasýsla and Borgarfjarðarsýsla placement varies by source, verify"
+Austfirðingafjórðungur,"Austur-Skaftafellssýsla;Suður-Múlasýsla;Norður-Múlasýsla",medium,"Eastern Quarter - smallest in sýsla count, historically the least populous"

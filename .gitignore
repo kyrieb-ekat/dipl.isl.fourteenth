@@ -5,3 +5,8 @@ __pycache__/
 charter_pipeline/output/
 charter_pipeline/.venv/
 .claude/launch.json
+
+# nafnid.is/Árnastofnun scrape — personal working copy pending ToS confirmation
+# with Árnastofnun's onomastics department; not for publication. See
+# charter_pipeline/nafnid/README.md. Re-pull via pull_nafnid.py/pull_endpoint.py.
+charter_pipeline/nafnid/data/

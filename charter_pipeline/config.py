@@ -27,6 +27,13 @@ AUTHORITY_FILE = Path(os.environ.get(
     "AUTHORITY_FILE", Path.home() / "Desktop" / "McGill" / "diss" / "CHARTER_authority_file.xlsx"
 ))
 
+# nafnid.is (Árnastofnun) place-name reconciliation — supplementary geocoding
+# source alongside the Wikidata lookup in 04_lookup_coords.py. See
+# nafnid/README.md for the pull-script usage caveat.
+NAFNID_DIR         = Path(__file__).parent / "nafnid"
+NAFNID_DATA_DIR    = NAFNID_DIR / "data"
+NAFNID_LOOKUP_DIR  = NAFNID_DIR / "lookup_tables"
+
 # ── Claude API ─────────────────────────────────────────────────────────────
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 4096
