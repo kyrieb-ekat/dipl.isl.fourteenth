@@ -75,6 +75,20 @@ def fuzzy_match(name: str, lookup: dict[str, str], authority_df: pd.DataFrame):
     return matched_id, score, row["canonical"]
 
 
+_CHARTER_YEAR_RE = re.compile(r"(\d{3,4})")
+
+
+def charter_year(date_str) -> str:
+    """Extracts the leading 3-4 digit year from a charter's extracted date
+    field (formats seen in real data: 'YYYY', 'YYYY-MM', 'YYYY-MM-DD', and
+    occasionally an uncertain range like '1265/1449' -- for the latter, the
+    first year is used as a single anchor point, not the full range)."""
+    m = _CHARTER_YEAR_RE.match((date_str or "").strip())
+    if not m:
+        return ""
+    return str(int(m.group(1)))
+
+
 def resolve_persons(
     persons: list[dict],
     persons_df: pd.DataFrame,
@@ -82,6 +96,7 @@ def resolve_persons(
     existing_ids: list[str],
     fuzzy_accept: int = FUZZY_ACCEPT,
     fuzzy_review: int = FUZZY_REVIEW,
+    charter_year_str: str = "",
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """
     Returns:
@@ -122,8 +137,11 @@ def resolve_persons(
                     "patronymic": "",
                     "occupation": p.get("role_category", ""),
                     "title": p.get("qualifier", ""),
-                    "floruit_start": "",
-                    "floruit_end": "",
+                    # Single-point anchor from the charter's own date, not a
+                    # true attested lifespan -- cross-charter matching tools
+                    # apply their own +/- tolerance on top of this.
+                    "floruit_start": charter_year_str,
+                    "floruit_end": charter_year_str,
                     "gender": "",
                     "associated_places": "",
                     "notes": "",
@@ -303,7 +321,7 @@ def main():
 
         res_persons, new_p, rev_p = resolve_persons(
             ch.get("persons", []), persons_df, persons_lookup, running_person_ids,
-            fuzzy_accept=fa, fuzzy_review=fr,
+            fuzzy_accept=fa, fuzzy_review=fr, charter_year_str=charter_year(ch.get("date")),
         )
         res_places, new_l, rev_l = resolve_places(
             ch.get("locations", []), ch.get("all_places_mentioned", []),
