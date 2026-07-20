@@ -41,8 +41,17 @@ _HEADER_PATTERNS = [
 FOOTNOTE_RE = re.compile(r"^\s*\d+\)\s")  # "1) footnote text"
 
 
-def is_charter_header(line: str) -> bool:
-    return any(p.match(line) for p in _HEADER_PATTERNS)
+def is_charter_header(line: str, allow_year_range: bool = True) -> bool:
+    """allow_year_range=False disables pattern #4 (bare year range, e.g.
+    "834—1264."). DI volume title pages state the whole volume's covering
+    date range in exactly this shape, which false-positives as a charter
+    header when no charter has opened yet — see segment_volume()."""
+    for i, pattern in enumerate(_HEADER_PATTERNS):
+        if i == 3 and not allow_year_range:
+            continue
+        if pattern.match(line):
+            return True
+    return False
 
 
 def extract_text_from_pdf(pdf_path: Path) -> str:
@@ -86,7 +95,11 @@ def segment_volume(pages: list[tuple[int, str]]) -> list[dict]:
                     current["text"] += "\n"
                 continue
 
-            if is_charter_header(stripped):
+            if current is None and _HEADER_PATTERNS[3].match(stripped):
+                print(f"[vol] Skipping suspected front-matter year-range line "
+                      f"(page {page_num}): {stripped!r} — not opening charter #1 with it.")
+
+            if is_charter_header(stripped, allow_year_range=current is not None):
                 # Save previous charter
                 if current:
                     charters.append(current)
@@ -108,6 +121,36 @@ def segment_volume(pages: list[tuple[int, str]]) -> list[dict]:
     return charters
 
 
+def warn_on_length_outliers(charters: list[dict], vol_num: int, multiplier: float = 6.0) -> None:
+    """Print a loud warning if any segment is a suspicious multiple of the volume's
+    median segment length — a strong signal of front-matter contamination or a
+    missed header, so a human notices at Step 1 instead of 3 steps later."""
+    if len(charters) < 3:
+        return
+    lengths = sorted(len(c["text"].splitlines()) for c in charters)
+    median = lengths[len(lengths) // 2] or 1
+    for c in charters:
+        length = len(c["text"].splitlines())
+        if length > multiplier * median:
+            print(
+                f"[vol {vol_num}] WARNING: charter seq {c['seq']} is {length} lines "
+                f"({length / median:.1f}x the volume median of {median}) — likely "
+                f"front-matter contamination or mis-segmentation. Inspect "
+                f"DI_{vol_num:02d}_{c['seq']:04d}.txt manually before running "
+                f"02_extract_entities.py on this volume."
+            )
+
+
+def infer_volume_number(pdf_path: Path) -> int:
+    """Best-effort: DI PDFs are named like 'Diplomatarium_Islandicum___Bindi_14.pdf' —
+    use the trailing integer in the filename as the volume number, rather than
+    positional/lexicographic ordering (which sorts Bindi_10 before Bindi_2)."""
+    m = re.search(r"(\d+)\s*$", pdf_path.stem)
+    if not m:
+        raise ValueError(f"Could not infer DI volume number from filename: {pdf_path.name}")
+    return int(m.group(1))
+
+
 def process_volume(pdf_path: Path, vol_num: int) -> Path:
     """Extract, segment, and save one DI volume. Returns path to charter_index.csv."""
     print(f"[vol {vol_num}] Extracting text from {pdf_path.name} …")
@@ -116,6 +159,7 @@ def process_volume(pdf_path: Path, vol_num: int) -> Path:
 
     charters = segment_volume(pages)
     print(f"[vol {vol_num}] {len(charters)} charter segments found.")
+    warn_on_length_outliers(charters, vol_num)
 
     vol_dir = SEGMENTS_DIR / f"vol{vol_num:02d}"
     vol_dir.mkdir(parents=True, exist_ok=True)
@@ -159,12 +203,12 @@ def main():
     if args.pdf:
         process_volume(args.pdf, args.vol)
     else:
-        pdfs = sorted(args.pdf_dir.glob(args.pattern))
+        pdfs = sorted(args.pdf_dir.glob(args.pattern), key=infer_volume_number)
         if not pdfs:
             print(f"No PDFs found matching {args.pattern} in {args.pdf_dir}", file=sys.stderr)
             sys.exit(1)
-        for i, pdf in enumerate(pdfs, start=1):
-            process_volume(pdf, i)
+        for pdf in pdfs:
+            process_volume(pdf, infer_volume_number(pdf))
 
     print("Done. Check output/segments/ for charter text files.")
 
