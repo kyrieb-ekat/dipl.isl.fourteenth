@@ -25,6 +25,31 @@ _AUTHORITY_HEADERS = [
 ]
 
 
+def _normalize_header(name: str) -> str:
+    """Whitespace/case-insensitive key for matching authority CSV column names."""
+    return name.strip().lower()
+
+
+def _resolve_fieldnames(real_fieldnames: list, canonical_headers: list) -> tuple:
+    """
+    Match `canonical_headers` against `real_fieldnames` (whatever is actually
+    on disk) using a normalized comparison, so a stray whitespace difference
+    never causes a duplicate column to be appended. Mirrors the equivalent
+    helper in 04c_add_to_authority.py -- this file's real header currently
+    matches _AUTHORITY_HEADERS exactly, so this is a preemptive fix for the
+    same bug shape, not yet triggered here.
+
+    Returns (fieldnames, norm_to_real) -- see 04c_add_to_authority.py for details.
+    """
+    fieldnames = list(real_fieldnames)
+    norm_to_real = {_normalize_header(f): f for f in fieldnames}
+    for canonical in canonical_headers:
+        if _normalize_header(canonical) not in norm_to_real:
+            fieldnames.append(canonical)
+            norm_to_real[_normalize_header(canonical)] = canonical
+    return fieldnames, norm_to_real
+
+
 def _map_row(row: dict) -> dict:
     return {
         "person_id":      (row.get("person_id") or "").strip(),
@@ -81,21 +106,23 @@ def add_to_authority(csv_path: Path, dry_run: bool = False):
         return
 
     auth_rows = []
-    auth_fieldnames = _AUTHORITY_HEADERS
+    real_fieldnames = _AUTHORITY_HEADERS
     if AUTHORITY_PATH.exists():
         with open(AUTHORITY_PATH, encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
-            auth_fieldnames = list(reader.fieldnames or _AUTHORITY_HEADERS)
+            real_fieldnames = list(reader.fieldnames or _AUTHORITY_HEADERS)
             auth_rows = list(reader)
 
     bak = AUTHORITY_PATH.with_suffix(".csv.bak")
     shutil.copy2(AUTHORITY_PATH, bak)
 
-    for key in _AUTHORITY_HEADERS:
-        if key not in auth_fieldnames:
-            auth_fieldnames.append(key)
+    auth_fieldnames, norm_to_real = _resolve_fieldnames(real_fieldnames, _AUTHORITY_HEADERS)
 
-    auth_rows.extend(new_entries)
+    remapped_entries = [
+        {norm_to_real[_normalize_header(k)]: v for k, v in entry.items()}
+        for entry in new_entries
+    ]
+    auth_rows.extend(remapped_entries)
 
     with open(AUTHORITY_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=auth_fieldnames, extrasaction="ignore")

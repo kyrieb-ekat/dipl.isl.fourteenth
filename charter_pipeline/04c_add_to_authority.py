@@ -34,6 +34,35 @@ _AUTHORITY_HEADERS = [
 ]
 
 
+def _normalize_header(name: str) -> str:
+    """Whitespace/case-insensitive key for matching authority CSV column names."""
+    return name.strip().lower()
+
+
+def _resolve_fieldnames(real_fieldnames: list, canonical_headers: list) -> tuple:
+    """
+    Match `canonical_headers` (our hardcoded, no-leading-space names) against
+    `real_fieldnames` (whatever is actually on disk, including any stray
+    whitespace) using a normalized comparison -- mirroring the normalization
+    place_authority.py/person_authority.py already do on load -- so we don't
+    append a duplicate column just because of a whitespace difference.
+
+    Returns:
+        fieldnames   -- real_fieldnames, with any canonical header that has no
+                        normalized match appended verbatim.
+        norm_to_real -- {normalized_name: actual_fieldname_string_in_use}, so
+                        new rows can be written using the REAL on-disk key
+                        spelling rather than silently rewriting the header.
+    """
+    fieldnames = list(real_fieldnames)
+    norm_to_real = {_normalize_header(f): f for f in fieldnames}
+    for canonical in canonical_headers:
+        if _normalize_header(canonical) not in norm_to_real:
+            fieldnames.append(canonical)
+            norm_to_real[_normalize_header(canonical)] = canonical
+    return fieldnames, norm_to_real
+
+
 def _wikidata_id(row: dict) -> str:
     return (row.get("wikidata_id") or row.get("proposed_wikidata_id") or "").strip()
 
@@ -92,22 +121,28 @@ def add_to_authority(csv_path: Path, dry_run: bool = False):
 
     # Read raw authority file to preserve formatting/extra columns
     auth_rows = []
-    auth_fieldnames = _AUTHORITY_HEADERS
+    real_fieldnames = _AUTHORITY_HEADERS
     if AUTHORITY_PATH.exists():
         with open(AUTHORITY_PATH, encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
-            auth_fieldnames = list(reader.fieldnames or _AUTHORITY_HEADERS)
+            real_fieldnames = list(reader.fieldnames or _AUTHORITY_HEADERS)
             auth_rows = list(reader)
 
     bak = AUTHORITY_PATH.with_suffix(".csv.bak")
     shutil.copy2(AUTHORITY_PATH, bak)
 
-    # Ensure all new entry keys are in fieldnames
-    for key in _AUTHORITY_HEADERS:
-        if key not in auth_fieldnames:
-            auth_fieldnames.append(key)
+    # Match our canonical header names against the file's real fieldnames in a
+    # whitespace/case-insensitive way, so e.g. " x(N) coords" (leading space,
+    # on disk) and "x(N) coords" (our constant) are recognized as the same
+    # column instead of producing a duplicate.
+    auth_fieldnames, norm_to_real = _resolve_fieldnames(real_fieldnames, _AUTHORITY_HEADERS)
 
-    auth_rows.extend(new_entries)
+    # Re-key each new entry so it writes into whichever real column is in use.
+    remapped_entries = [
+        {norm_to_real[_normalize_header(k)]: v for k, v in entry.items()}
+        for entry in new_entries
+    ]
+    auth_rows.extend(remapped_entries)
 
     with open(AUTHORITY_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=auth_fieldnames, extrasaction="ignore")
