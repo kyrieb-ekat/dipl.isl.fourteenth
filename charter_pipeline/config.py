@@ -2,11 +2,18 @@
 Central configuration for the Diplomatarium Islandicum extraction pipeline.
 Edit paths and thresholds here before running any step.
 """
+import os
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 # Directory containing your DI PDF volumes (e.g. Diplomatarium_Islandicum___Bindi_1.pdf)
-PDF_DIR = Path.home() / "Desktop" / "Charters" / "pdfs"
+# Override via PDF_DIR in .env — these locations move when machines/accounts get
+# reorganized, so don't rely on the hardcoded default surviving.
+PDF_DIR = Path(os.environ.get("PDF_DIR", Path.home() / "Desktop" / "Charters" / "pdfs"))
 
 # Output root — intermediate files and final CSVs land here
 OUTPUT_DIR = Path(__file__).parent / "output"
@@ -15,7 +22,10 @@ ENTITIES_DIR = OUTPUT_DIR / "entities"  # raw JSON from Claude API
 REVIEW_DIR   = OUTPUT_DIR / "review"    # per-volume CSVs for manual review
 
 # Authority file (read-only during extraction; updated only by 06_merge_into_xlsx.py)
-AUTHORITY_FILE = Path.home() / "Desktop" / "McGill" / "diss" / "CHARTER_authority_file.xlsx"
+# Override via AUTHORITY_FILE in .env — see note on PDF_DIR above.
+AUTHORITY_FILE = Path(os.environ.get(
+    "AUTHORITY_FILE", Path.home() / "Desktop" / "McGill" / "diss" / "CHARTER_authority_file.xlsx"
+))
 
 # ── Claude API ─────────────────────────────────────────────────────────────
 MODEL = "claude-sonnet-4-6"
