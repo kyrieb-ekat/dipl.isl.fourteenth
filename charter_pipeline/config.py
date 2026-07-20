@@ -44,6 +44,18 @@ FUZZY_ACCEPT  = 85   # score ≥ this → auto-assign existing ID
 FUZZY_REVIEW  = 60   # score in [60,85) → flag for manual review
                      # score < 60 → treat as new entity
 
+# When resolve_places() is about to mint a brand-new place_id, first check it
+# against the OTHER new places already minted earlier in the SAME charter
+# (not the full authority) to catch near-duplicate spellings of one place
+# (e.g. "Hamaburg" vs "Hammaburg"). Measured against real examples, genuine
+# spelling variants of the same place scored 87-94 (token_sort_ratio), while
+# distinct-but-similar short Icelandic place-name elements (e.g.
+# "Fell"/"Felli", "Nes"/"Nesi") scored 83-89 -- there is no threshold that
+# cleanly separates the two, so this is deliberately close to (not far above)
+# FUZZY_ACCEPT rather than "stricter", combined with variant accumulation
+# in resolve_places() so repeated near-duplicate mentions still converge.
+NEW_PLACE_DEDUP_THRESHOLD = 88
+
 # ── Segmentation ───────────────────────────────────────────────────────────
 # Regex for DI charter date headers (covers most volume formats)
 # Matches: "15. Mai 834." or "1341." or "1341. júní 14."

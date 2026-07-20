@@ -17,6 +17,7 @@ Writes:
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -24,8 +25,12 @@ import pandas as pd
 from rapidfuzz import fuzz, process
 
 sys.path.insert(0, str(Path(__file__).parent))
-from config import ENTITIES_DIR, REVIEW_DIR, AUTHORITY_FILE, FUZZY_ACCEPT, FUZZY_REVIEW
+from config import ENTITIES_DIR, REVIEW_DIR, AUTHORITY_FILE, FUZZY_ACCEPT, FUZZY_REVIEW, NEW_PLACE_DEDUP_THRESHOLD
 from place_authority import PlaceAuthority
+
+# Matches a trailing parenthetical qualifier, e.g. " (Hamaburg / Hammaburg)".
+# Kept in sync with place_authority._PAREN_TAIL.
+_PAREN_TAIL = re.compile(r'\s*\([^)]*\)\s*$')
 
 
 def load_authority(sheet: str, id_col: str, name_col: str, variant_col: str) -> pd.DataFrame:
@@ -130,6 +135,50 @@ def resolve_persons(
     return resolved, new_persons, review_items
 
 
+def _new_place_name_forms(entry: dict) -> list[str]:
+    """canonical_name + any variant_names recorded so far for a not-yet-authority
+    new place, each with a trailing parenthetical stripped and lowercased —
+    mirrors PlaceAuthority.all_names()."""
+    forms = [entry["canonical_name"]] + [
+        v for v in (entry.get("variant_names") or "").split(";") if v.strip()
+    ]
+    out = []
+    for s in forms:
+        s = _PAREN_TAIL.sub("", s).strip().lower()
+        if s:
+            out.append(s)
+    return out
+
+
+def _match_existing_new_place(name: str, new_places: list[dict], threshold: int) -> tuple[str | None, int]:
+    """
+    Fuzzy-check `name` against every place already minted as NEW earlier in
+    this same charter (new_places is charter-scoped inside resolve_places()).
+    Returns (place_id, score) of the best match at/above `threshold`, else (None, 0).
+    """
+    best_id, best_score = None, 0
+    key = _PAREN_TAIL.sub("", name).strip().lower() or name.strip().lower()
+    for entry in new_places:
+        for form in _new_place_name_forms(entry):
+            score = fuzz.token_sort_ratio(key, form)
+            if score > best_score:
+                best_score, best_id = score, entry["place_id"]
+    return (best_id, best_score) if best_score >= threshold else (None, 0)
+
+
+def _record_variant(new_places: list[dict], place_id: str, spelling: str) -> None:
+    """Append a newly-discovered alternate spelling to the matched new place's
+    variant_names, so a later differently-spelled mention of the same place
+    (within this charter) has more name forms to match against."""
+    for entry in new_places:
+        if entry["place_id"] == place_id:
+            existing = [v for v in (entry.get("variant_names") or "").split(";") if v.strip()]
+            if spelling not in existing:
+                existing.append(spelling)
+            entry["variant_names"] = ";".join(existing)
+            return
+
+
 def resolve_places(
     locations: list[dict],
     all_places: list[str],
@@ -139,6 +188,7 @@ def resolve_places(
     place_auth: PlaceAuthority | None = None,
     fuzzy_accept: int = FUZZY_ACCEPT,
     fuzzy_review: int = FUZZY_REVIEW,
+    new_place_dedup: int = NEW_PLACE_DEDUP_THRESHOLD,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     resolved, new_places, review_items = [], [], []
     seen_new: dict[str, str] = {}
@@ -165,21 +215,27 @@ def resolve_places(
             if name.lower() in seen_new:
                 pid = seen_new[name.lower()]
             else:
-                pid = next_id(existing_ids + [r["place_id"] for r in new_places], "l")
-                seen_new[name.lower()] = pid
-                new_places.append({
-                    "place_id": pid,
-                    "canonical_name": name,
-                    "variant_names": "",
-                    "place_type": "",
-                    "coordinates_lat": "",
-                    "coordinates_long": "",
-                    "region": region,
-                    "district": "",
-                    "modern_equivalent": "",
-                    "notes": "",
-                    "sources": "",
-                })
+                dup_id, _dup_score = _match_existing_new_place(name, new_places, new_place_dedup)
+                if dup_id is not None:
+                    pid = dup_id
+                    seen_new[name.lower()] = pid
+                    _record_variant(new_places, pid, name)
+                else:
+                    pid = next_id(existing_ids + [r["place_id"] for r in new_places], "l")
+                    seen_new[name.lower()] = pid
+                    new_places.append({
+                        "place_id": pid,
+                        "canonical_name": name,
+                        "variant_names": "",
+                        "place_type": "",
+                        "coordinates_lat": "",
+                        "coordinates_long": "",
+                        "region": region,
+                        "district": "",
+                        "modern_equivalent": "",
+                        "notes": "",
+                        "sources": "",
+                    })
             return {"name": name, "role": role, "region": region,
                     "place_id": pid, "match_score": 0}, None, True
 
