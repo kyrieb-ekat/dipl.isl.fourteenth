@@ -56,6 +56,21 @@ FUZZY_REVIEW  = 60   # score in [60,85) → flag for manual review
 # in resolve_places() so repeated near-duplicate mentions still converge.
 NEW_PLACE_DEDUP_THRESHOLD = 88
 
+# Cross-volume/authority person duplicate candidate matching
+# (07_find_person_duplicates.py). Measured against real examples:
+# genuine spelling/orthographic variants of the same person scored 90-100
+# (token_sort_ratio), while different people who happen to share a common
+# first name and similar-sounding patronymic (e.g. "Guðmundr Þorláksson" vs
+# "Guðmundr Þorleifsson" -- different fathers) scored as high as 87.2 --
+# close enough to a naive "88-ish" cutoff that it needs its own,
+# higher-margin threshold plus a separate lower "possible" tier rather than
+# one single line, so that near-miss different-person pairs land as
+# flagged/uncertain rather than either silently dropped or wrongly
+# promoted to "likely".
+PERSON_DUP_NAME_HIGH = 90     # name_score >= this (with compatible dates) -> likely_duplicate
+PERSON_DUP_NAME_MEDIUM = 78   # name_score >= this -> possible_duplicate (flagged, uncertain)
+PERSON_DUP_DATE_TOLERANCE_YEARS = 30   # +/- window applied to floruit_start/end before checking overlap
+
 # ── Segmentation ───────────────────────────────────────────────────────────
 # Regex for DI charter date headers (covers most volume formats)
 # Matches: "15. Mai 834." or "1341." or "1341. júní 14."

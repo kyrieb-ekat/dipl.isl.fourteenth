@@ -154,8 +154,8 @@ geocoded_path = config.REVIEW_DIR / f"{vol}_places_new_geocoded.csv"
 auth_pl_path  = SCRIPTS / "place_names_authority.csv"
 auth_pe_path  = SCRIPTS / "person_names_authority.csv"
 
-tab_pipeline, tab_queue, tab_entities, tab_authority = st.tabs(
-    ["Pipeline", "Review Queue", "New Entities", "Authority Browser"]
+tab_pipeline, tab_queue, tab_entities, tab_dupes, tab_authority = st.tabs(
+    ["Pipeline", "Review Queue", "New Entities", "Person Duplicates", "Authority Browser"]
 )
 
 
@@ -680,7 +680,88 @@ with tab_entities:
             st.session_state[plkey] = save_pl
 
 
-# ── tab 3: authority browser ──────────────────────────────────────────────────
+# ── tab 3: person duplicates ──────────────────────────────────────────────────
+# Cross-volume + authority person duplicate candidates from
+# 07_find_person_duplicates.py -- unlike every other tab, this is NOT scoped
+# to the sidebar's selected volume; it compares across every volume that's
+# been processed so far, plus the already-promoted authority. Marking a
+# decision here does not modify any other file -- confirmed merges (relinking
+# charter references, removing the duplicate row) are applied manually.
+
+with tab_dupes:
+    st.caption(
+        "Compares every new-entity person across all processed volumes against "
+        "each other and against `person_names_authority.csv`, using name "
+        "similarity plus a ±30-year floruit tolerance. Flag-only: marking a "
+        "decision here never modifies charters.csv or the authority file."
+    )
+
+    dup_run_key = "s7_dupes"
+    if st.button("Run duplicate finder", key="btn_s7", disabled=is_running(dup_run_key)):
+        st.session_state.pop("person_dupes", None)
+        run_command([PYTHON, "07_find_person_duplicates.py"], dup_run_key)
+        st.rerun()
+    still_running = step_output(dup_run_key)
+    if still_running:
+        time.sleep(0.5)
+        st.rerun()
+
+    dupes_path = config.REVIEW_DIR / "cross_volume_person_duplicates.csv"
+    dkey = "person_dupes"
+    if dkey not in st.session_state:
+        st.session_state[dkey] = load_csv(dupes_path, add_cols={"decision": ""})
+
+    df_dupes = st.session_state[dkey]
+
+    if df_dupes.empty:
+        st.info(
+            "No duplicate candidates on file yet. Click **Run duplicate finder** above "
+            "(requires at least one volume's persons_new.csv or the authority file to exist)."
+        )
+    else:
+        n_done = (df_dupes["decision"].str.strip() != "").sum()
+        st.caption(
+            f"**{n_done} / {len(df_dupes)}** decisions recorded — "
+            "sorted highest-confidence first · edit the **Decision** column"
+        )
+
+        edited_dupes = st.data_editor(
+            df_dupes,
+            key=f"ed_{dkey}",
+            use_container_width=True,
+            num_rows="fixed",
+            hide_index=True,
+            column_config={
+                "a_id": st.column_config.TextColumn("A · ID", width="small", disabled=True),
+                "a_name": st.column_config.TextColumn("A · Name", width="medium", disabled=True),
+                "a_source": st.column_config.TextColumn("A · Source", width="small", disabled=True),
+                "a_floruit": st.column_config.TextColumn("A · Floruit", width="small", disabled=True),
+                "a_occupation": st.column_config.TextColumn("A · Occupation", width="medium", disabled=True),
+                "a_title": st.column_config.TextColumn("A · Title", width="medium", disabled=True),
+                "b_id": st.column_config.TextColumn("B · ID", width="small", disabled=True),
+                "b_name": st.column_config.TextColumn("B · Name", width="medium", disabled=True),
+                "b_source": st.column_config.TextColumn("B · Source", width="small", disabled=True),
+                "b_floruit": st.column_config.TextColumn("B · Floruit", width="small", disabled=True),
+                "b_occupation": st.column_config.TextColumn("B · Occupation", width="medium", disabled=True),
+                "b_title": st.column_config.TextColumn("B · Title", width="medium", disabled=True),
+                "name_score": st.column_config.NumberColumn("Name score", format="%.0f", width="small", disabled=True),
+                "date_status": st.column_config.TextColumn("Dates", width="small", disabled=True),
+                "classification": st.column_config.TextColumn("Classification", width="medium", disabled=True),
+                "confidence": st.column_config.TextColumn("Confidence", width="small", disabled=True),
+                "decision": st.column_config.SelectboxColumn(
+                    "Decision",
+                    options=["", "same", "different"],
+                    width="small",
+                    help="same = confirmed duplicate, apply the merge manually  ·  different = false positive, dismiss",
+                ),
+            },
+        )
+
+        autosave(dkey, edited_dupes, dupes_path)
+        st.session_state[dkey] = edited_dupes
+
+
+# ── tab 4: authority browser ──────────────────────────────────────────────────
 
 with tab_authority:
     search = st.text_input(
