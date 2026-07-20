@@ -1,0 +1,51 @@
+person_id,canonical_name,wikidata_id,variants,patronymic,occupation,title,floruit_start,floruit_end,gender,notes
+p001,"Audun, Bishop of Holar",,,,,,1315,,,
+p002,Bauðvarr,,,Guðmundarson,priest-sealing,,1341,,M,
+p003,Benedictus,,Benedict,,saint-patron,,1344,,,
+p004,Benedikt,,,Kolbeinsson,layman.seller,,1343,,M,
+p005,Benedikt?,,,,,,1340,,,
+p006,Bishop Laurencius of Holar,,Laurentius,,bishop_Hólar,,1330,,,
+p007,Bjarni,,,,priest.issuer,,1345,,,
+p008,Bryjólfr,,,Bjarnarson,priest-sealing,,1341,,M,
+p009,Brynjólfur,,,Bjarnarson,priest,,1340,,M,
+p010,Bárðr bóndi,,,,farmer,,1344,,,
+p011,Egill of Hólar,,,,bishop; bishop.buyer,,1341,1343,,
+p012,Einar,,,Gíslason,priest,,1340,,M,
+p013,Einar,,,Grímsson,layman,,1341,,M,
+p014,Einar,,Einarr,Hafliðason,priest-sealing,,1341,,M,"Officialis of Hólar, priest, student of Laurentius biskups"
+p015,Einar,,,Sigvatsson,layman.seller,,1343,,M,
+p016,Eiriker,,,,clergyman-clerk,,1343,,,
+p017,Eriríkr,,,,priest.issuer,,1345,,,
+p018,Geirr,,,Þorsteinsson,layman; priest,,1340,1343,M,
+p019,Gunnaugr,,,Stefánsson,,,1345,,M,Relations: seller-son
+p020,Halldórr,,,Tómasson,layman,,1343,,M,
+p021,Herra Egill biskup,,Egil,,,,1340,,,Bishop of…
+p022,Jorundr biskups,,,,,,1315,,,Bishop of Hólar (1267–1312)
+p023,Jungrú María,,,,saint-patron,,1344,,F,Virgin Mary
+p024,Jón,,,Branarson,priest,,1340,,M,
+p025,Jón,,,Koðrason,priest; priest-witness,,1341,1345,M,
+p026,Jón,,,Þorleifsson,layman-sealing,,1341,,M,
+p027,Jón,,Jón biskups,Sigurðarson,bishop_Skálholt,,1344,,M,Bishop of Skálholt 1343–1348
+p028,Kolbein,,,Benediktsson,layman.seller,,1343,,M,
+p029,Ormr biskup,,Orm,Ásláksson,bishop_Hólar.buyer_Mikligarður,,1345,,M,"Bishop of Hólar (1343-56), succeeded Egill Eyjólfsson (Bishop of Hólar 1332–41) (with Einarr Hafliðason managing the empty seat in between). Norwegian. Unpopular."
+p030,Priest Stephán,,Stephán,Gunnlaugsson,priest,,1330,,M,Priest
+p031,Páll,,,Þorsteinsson,priest,,1340,1341,M,
+p032,Páll,,,,priest.issuer,,1345,,,
+p033,Pétr,,,Halldórsson,lawman,,1341,,M,
+p034,Rafn,,,Jónsson,opponent,,1340,1341,M,
+p035,Sigurðr,,,Bjarnarson,witness-testimony,,1341,,M,
+p036,Sigurðr,,,Grímsson,layman-sealing,,1341,,M,
+p037,St. Swithun,,,,,,1395,,,
+p038,Stefán,,,,abbot_Munkaþvera.seller,,1345,,,
+p039,Ólafr helgi,,,,saint-patron,,1344,,,
+p040,Óláfr,,,Einarsson,layman,,1343,,M,
+p041,Úlfr,,,Stefánsson,,,1345,,M,Relations: seller-son
+p042,Þorgeirr,,,,prior-Þingeyrar,,1343,,,
+p043,Þorkell,,,Magnússon,witness-testimony,,1341,,M,
+p044,Þorkell Langr,,,,witness-boundary,,1341,,,
+p045,Þorleifr,,,,priest.issuer,,1345,,,
+p046,Þorsteinn,,,Kolbeinsson,,,1343,,M,
+p047,Þorvaldr,,,Magnússon,priest-sealing,,1341,,M,
+p048,Þorvarðr,,,Grímsson,priest,,1341,,M,
+p049,Þorvaðr,,,Grímsson,priest,,1340,,M,
+p050,Þórhallr,,,,witness-boundary,,1341,,,
