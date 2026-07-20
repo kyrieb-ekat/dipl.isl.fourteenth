@@ -21,7 +21,7 @@ from pathlib import Path
 import anthropic
 
 sys.path.insert(0, str(Path(__file__).parent))
-from config import SEGMENTS_DIR, ENTITIES_DIR, MODEL, MAX_TOKENS, BATCH_SIZE
+from config import SEGMENTS_DIR, ENTITIES_DIR, MODEL, MAX_TOKENS
 
 # ── System prompt (will be cached) ─────────────────────────────────────────
 SYSTEM_PROMPT = """You are an expert in medieval Icelandic documentary history specialising in the Diplomatarium Islandicum (DI) — the published edition of Icelandic medieval charters (bréf) and related documents from the 9th to 16th centuries.
@@ -96,7 +96,8 @@ def load_index(vol_dir: Path) -> list[dict]:
 
 
 def load_existing_results(out_path: Path) -> dict[str, dict]:
-    """Load already-processed charters so we can resume without re-calling the API."""
+    """Load all previously-saved charter rows (successes AND error placeholders),
+    keyed by filename. Callers decide what counts as 'done' via is_error_result."""
     if not out_path.exists():
         return {}
     with open(out_path, encoding="utf-8") as f:
@@ -104,10 +105,24 @@ def load_existing_results(out_path: Path) -> dict[str, dict]:
     return {item["filename"]: item for item in data}
 
 
+def is_error_result(item: dict) -> bool:
+    """True if a previously-saved row represents a failed call that should be
+    retried on the next run, rather than a permanent success."""
+    return "_parse_error" in item or "_api_error" in item
+
+
 def save_results(results: list[dict], out_path: Path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
+
+
+class CharterParseError(Exception):
+    """Claude's response wasn't valid JSON. Carries the raw text so a failed
+    response can be inspected/salvaged rather than only its exception message."""
+    def __init__(self, message: str, raw_text: str):
+        super().__init__(message)
+        self.raw_text = raw_text
 
 
 def extract_charter(client: anthropic.Anthropic, charter_text: str) -> dict:
@@ -131,11 +146,15 @@ def extract_charter(client: anthropic.Anthropic, charter_text: str) -> dict:
     )
     raw = response.content[0].text.strip()
     # Strip accidental markdown fences if present
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw)
+    candidate = raw
+    if candidate.startswith("```"):
+        candidate = candidate.split("```")[1]
+        if candidate.startswith("json"):
+            candidate = candidate[4:]
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as e:
+        raise CharterParseError(str(e), raw_text=raw) from e
 
 
 def main():
@@ -157,17 +176,25 @@ def main():
 
     index = load_index(vol_dir)
     existing = load_existing_results(out_path)
-    results = list(existing.values())
 
-    # Filter to requested range
+    # Filter to requested range. Charters that previously failed (_parse_error
+    # or _api_error) are retried automatically on a plain re-run, not
+    # permanently skipped — a re-run's --start/--end already scopes which
+    # charters are touched, so no separate opt-in flag is needed.
     charters_to_process = [
         row for row in index
         if args.start <= int(row["sequence"]) <= (args.end or len(index))
-        and row["filename"] not in existing
+        and (row["filename"] not in existing or is_error_result(existing[row["filename"]]))
     ]
+    retry_filenames = {row["filename"] for row in charters_to_process}
+    # Keep prior rows we are NOT about to reprocess (successes, or errors
+    # outside this run's --start/--end range).
+    results = [item for fn, item in existing.items() if fn not in retry_filenames]
 
+    n_retrying = sum(1 for fn in retry_filenames if fn in existing)
     print(f"[vol {args.vol}] {len(charters_to_process)} charters to process "
-          f"({len(existing)} already done, will resume).")
+          f"({len(existing) - n_retrying} already done, "
+          f"{n_retrying} previously failed and will retry).")
 
     for i, row in enumerate(charters_to_process, start=1):
         txt_path = vol_dir / row["filename"]
@@ -180,9 +207,9 @@ def main():
 
         try:
             extracted = extract_charter(client, charter_text)
-        except json.JSONDecodeError as e:
+        except CharterParseError as e:
             print(f"PARSE ERROR — {e}")
-            extracted = {"_parse_error": str(e)}
+            extracted = {"_parse_error": str(e), "_raw_response": e.raw_text}
         except Exception as e:
             print(f"API ERROR — {e}")
             extracted = {"_api_error": str(e)}
@@ -198,10 +225,9 @@ def main():
         results.append(result)
         print("OK")
 
-        # Save after every charter so progress is not lost
-        if i % BATCH_SIZE == 0 or i == len(charters_to_process):
-            save_results(results, out_path)
-            print(f"    → Saved {len(results)} total results to {out_path.name}")
+        # Save after every charter so a kill mid-run only loses the charter
+        # currently in flight, not up to BATCH_SIZE-1 already-completed ones.
+        save_results(results, out_path)
 
     print(f"\nDone. Results in {out_path}")
 
