@@ -1,4 +1,12 @@
 """
+DEPRECATED as of the SQLite migration (see schema.sql/db.py/migrate_to_sqlite.py).
+Superseded by 06_export_authority.py, which reads charter_pipeline.db
+directly (read-only) instead of the per-volume review CSVs this script
+expects -- 05_export_csvs.py no longer produces vol{N}_charters.csv/
+persons_new.csv/places_new.csv at all. Left in place, unmodified, as a
+historical reference for how the pre-migration merge worked -- do not run
+this against current data; use 06_export_authority.py instead.
+
 Step 6: Merge approved review CSVs into the authority XLSX.
 
 Run this ONLY after you have reviewed and edited the CSVs from 05_export_csvs.py.
@@ -150,7 +158,15 @@ def main():
         safe_persons = persons_df
         print(f"New persons: {len(persons_df)} (no review_status column — merging all).")
 
-    print(f"New places:  {len(places_df)}")
+    # Gate places on review_status too (mirrors the persons gate above)
+    _PLACE_APPLY = {"", "ok", "add"}
+    if "review_status" in places_df.columns:
+        safe_places = places_df[places_df["review_status"].str.strip().str.lower().isin(_PLACE_APPLY)]
+        skipped_places = len(places_df) - len(safe_places)
+        print(f"New places: {len(safe_places)} to merge, {skipped_places} skipped (review_status=skip).")
+    else:
+        safe_places = places_df
+        print(f"New places:  {len(places_df)} (no review_status column — merging all).")
 
     if args.dry_run:
         print("\n[dry-run] No files written.")
@@ -168,8 +184,8 @@ def main():
     n_persons = append_rows_to_sheet(wb, "persons_authority", person_rows, "person_id")
     print(f"  Appended {n_persons} new person rows to persons_authority.")
 
-    # Append places
-    place_rows = places_df.to_dict("records")
+    # Append places (filtered by review_status if column present)
+    place_rows = safe_places.to_dict("records")
     n_places = append_rows_to_sheet(wb, "Places_Authority", place_rows, "place_id")
     print(f"  Appended {n_places} new place rows to Places_Authority.")
 

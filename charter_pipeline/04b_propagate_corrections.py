@@ -1,4 +1,16 @@
 """
+DEPRECATED as of the SQLite migration (see schema.sql/db.py/migrate_to_sqlite.py).
+This script operates on a standalone --csv file; 05_export_csvs.py no longer
+produces vol{N}_places_new.csv at all (places are written straight into
+charter_pipeline.db by 03_resolve_entities.py), so there is nothing for this
+script to reconcile against in the new pipeline. Its logic is superseded by
+db.reconcile_place_wikidata(place_pk), which does the equivalent find_place()
+lookup directly against the DB and is called automatically when a
+provisional place's canonical_name/variant_names changes, rather than as a
+separate manual CSV pass. Left in place, unmodified, as a historical
+reference for how the pre-migration reconciliation worked -- do not run this
+against current data.
+
 Step 4b: Reconcile place names against place_names_authority.csv.
 
 For each row in the places CSV, look up the canonical_name (and any listed
@@ -10,7 +22,7 @@ This is the OpenRefine reconciliation step: name string → Wikidata QID.
 Usage:
     python 04b_propagate_corrections.py --csv output/review/vol01_places_new.csv
     python 04b_propagate_corrections.py --csv output/review/vol01_places_new.csv --dry-run
-    python 04b_propagate_corrections.py --csv output/review/vol01_places_new_geocoded.csv --annotate
+    python 04b_propagate_corrections.py --csv output/review/vol01_places_new.csv --annotate
 
 --annotate mode:
     Writes proposed_place_id, proposed_wikidata_id, and review_status columns into

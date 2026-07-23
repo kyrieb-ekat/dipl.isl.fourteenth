@@ -27,6 +27,11 @@ AUTHORITY_FILE = Path(os.environ.get(
     "AUTHORITY_FILE", Path.home() / "Desktop" / "McGill" / "diss" / "CHARTER_authority_file.xlsx"
 ))
 
+# Canonical SQLite database (schema.sql) — replaces the per-volume CSVs and
+# the two authority stores above once migrate_to_sqlite.py has been run.
+# Deliberately NOT under OUTPUT_DIR: output/ is regenerable, this isn't.
+DB_PATH = Path(os.environ.get("DB_PATH", Path(__file__).parent / "charter_pipeline.db"))
+
 # nafnid.is (Árnastofnun) place-name reconciliation — supplementary geocoding
 # source alongside the Wikidata lookup in 04_lookup_coords.py. See
 # nafnid/README.md for the pull-script usage caveat.

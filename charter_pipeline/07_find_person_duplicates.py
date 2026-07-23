@@ -58,7 +58,6 @@ Strategy:
      predates floruit dates being populated at all.
 """
 
-import csv
 import re
 import sys
 from dataclasses import dataclass
@@ -67,8 +66,10 @@ from pathlib import Path
 from rapidfuzz import fuzz
 
 sys.path.insert(0, str(Path(__file__).parent))
-from config import REVIEW_DIR, PERSON_DUP_NAME_HIGH, PERSON_DUP_NAME_MEDIUM, PERSON_DUP_DATE_TOLERANCE_YEARS
-from person_authority import PersonAuthority, split_variants
+from config import PERSON_DUP_NAME_HIGH, PERSON_DUP_NAME_MEDIUM, PERSON_DUP_DATE_TOLERANCE_YEARS
+import db
+from db import split_variants
+from person_authority import _int_or_blank
 
 _PAREN_TAIL = re.compile(r"\s*\([^)]*\)\s*$")
 
@@ -90,7 +91,7 @@ def normalize_name(name: str) -> str:
 
 @dataclass
 class PersonCandidate:
-    id: str
+    id: int              # person_pk (was display_id string pre-migration)
     canonical_name: str
     variants: list
     floruit_start: str
@@ -101,33 +102,21 @@ class PersonCandidate:
 
 
 def load_candidates() -> list:
+    """Loads every person (canonical authority + every volume's provisional
+    rows) in one query -- simpler than the old two-source load (PersonAuthority
+    + a per-volume CSV glob), since everything is one table now."""
     candidates = []
-
-    auth = PersonAuthority()
-    for e in auth.entries:
+    df = db.get_persons()  # all statuses, all volumes
+    for row in df.to_dict("records"):
+        source = "authority" if row["status"] == "canonical" else f"vol{int(row['source_volume']):02d}"
         candidates.append(PersonCandidate(
-            id=e.person_id, canonical_name=e.canonical_name, variants=e.variants,
-            floruit_start=e.floruit_start, floruit_end=e.floruit_end,
-            occupation=e.occupation, title=e.title, source="authority",
+            id=row["person_pk"], canonical_name=row["canonical_name"],
+            variants=split_variants(row.get("variant_names") or ""),
+            floruit_start=_int_or_blank(row.get("floruit_start")),
+            floruit_end=_int_or_blank(row.get("floruit_end")),
+            occupation=row.get("occupation") or "", title=row.get("title") or "",
+            source=source,
         ))
-
-    for csv_path in sorted(REVIEW_DIR.glob("vol*_persons_new.csv")):
-        vol_label = csv_path.stem.replace("_persons_new", "")
-        with open(csv_path, encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                name = (row.get("canonical_name") or "").strip()
-                if not name:
-                    continue
-                candidates.append(PersonCandidate(
-                    id=row.get("person_id", ""), canonical_name=name,
-                    variants=split_variants(row.get("variant_names", "")),
-                    floruit_start=(row.get("floruit_start") or "").strip(),
-                    floruit_end=(row.get("floruit_end") or "").strip(),
-                    occupation=(row.get("occupation") or "").strip(),
-                    title=(row.get("title") or "").strip(),
-                    source=vol_label,
-                ))
-
     return candidates
 
 
@@ -252,23 +241,26 @@ def main():
 
     rows = find_duplicates(candidates)
 
-    out_path = REVIEW_DIR / "cross_volume_person_duplicates.csv"
     if not rows:
         print("No duplicate candidates found.")
-        if out_path.exists():
-            out_path.unlink()
         return
 
-    REVIEW_DIR.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+    # person_a_pk/person_b_pk instead of a_id/b_id -- db.upsert_person_duplicate_candidates()
+    # never overwrites a non-blank decision on re-run (fixes this script's old
+    # behavior of silently wiping a human's recorded same/different decision
+    # every time it was re-run).
+    db_rows = [{
+        "person_a_pk": r["a_id"], "person_b_pk": r["b_id"], "name_score": r["name_score"],
+        "date_status": r["date_status"], "classification": r["classification"],
+        "confidence": r["confidence"],
+    } for r in rows]
+    result = db.upsert_person_duplicate_candidates(db_rows)
 
     by_class = {}
     for r in rows:
         by_class[r["classification"]] = by_class.get(r["classification"], 0) + 1
-    print(f"Wrote {len(rows)} candidate pair(s) to {out_path.name}: "
+    print(f"Upserted {len(db_rows)} candidate pair(s) into person_duplicate_candidates "
+          f"({result['inserted']} new, {result['updated_or_unchanged']} refreshed/unchanged): "
           + ", ".join(f"{k}={v}" for k, v in by_class.items()))
 
 

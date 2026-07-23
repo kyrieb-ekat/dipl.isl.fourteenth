@@ -1,23 +1,34 @@
 """
-Step 3: Resolve extracted entity strings against existing authority files.
+Step 3: Resolve extracted entity strings against the canonical persons/places
+tables in charter_pipeline.db, minting provisional rows directly for anything
+that isn't a confident match.
 
 Usage:
     python 03_resolve_entities.py --vol 1
 
 Reads:
     output/entities/vol{N}_raw_entities.json
-    CHARTER_authority_FILE (persons_authority + Places_Authority sheets)
+    charter_pipeline.db — persons/places WHERE status='canonical'
 
 Writes:
     output/entities/vol{N}_resolved_entities.json
-        — each charter gets person_ids[], location_ids[], new_persons[], new_places[]
+        — each charter gets resolved_persons[]/resolved_locations[] (with
+          person_pk/place_pk ints, or "REVIEW:{pk}" strings for ambiguous
+          matches) and new_persons[]/new_places[] (pks minted for this run,
+          audit-only -- the rows already exist in the DB by the time this
+          file is written, unlike the old CSV pipeline which deferred
+          minting to 05_export_csvs.py).
     output/review/vol{N}_review_queue.csv
-        — ambiguous matches (score 60-84) for manual inspection
+        — ambiguous matches (score 60-84) for manual inspection, unchanged
+          shape from before the SQLite migration.
+
+Note: persons/places are minted straight into the DB as this script runs
+(via db.insert_provisional_person/place), not deferred to 05 -- see the
+module docstring in 05_export_csvs.py for the other half of this split.
 """
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -25,42 +36,32 @@ import pandas as pd
 from rapidfuzz import fuzz, process
 
 sys.path.insert(0, str(Path(__file__).parent))
-from config import ENTITIES_DIR, REVIEW_DIR, AUTHORITY_FILE, FUZZY_ACCEPT, FUZZY_REVIEW, NEW_PLACE_DEDUP_THRESHOLD
+from config import ENTITIES_DIR, REVIEW_DIR, FUZZY_ACCEPT, FUZZY_REVIEW, NEW_PLACE_DEDUP_THRESHOLD
+import db
+from db import _PAREN_TAIL
 from place_authority import PlaceAuthority
 
-# Matches a trailing parenthetical qualifier, e.g. " (Hamaburg / Hammaburg)".
-# Kept in sync with place_authority._PAREN_TAIL.
-_PAREN_TAIL = re.compile(r'\s*\([^)]*\)\s*$')
 
-
-def load_authority(sheet: str, id_col: str, name_col: str, variant_col: str) -> pd.DataFrame:
-    df = pd.read_excel(AUTHORITY_FILE, sheet_name=sheet, dtype=str).fillna("")
-    return df[[id_col, name_col, variant_col]].rename(
-        columns={id_col: "id", name_col: "canonical", variant_col: "variants"}
-    )
-
-
-def build_lookup(df: pd.DataFrame) -> dict[str, str]:
-    """Return {name_form: id} covering canonical + all variant spellings."""
-    lookup = {}
+def build_lookup(df: pd.DataFrame, id_col: str) -> dict[str, int]:
+    """Return {name_form: pk} covering canonical + all variant spellings.
+    Same shape as the pre-migration build_lookup(), just keyed to the
+    integer person_pk/place_pk instead of the old string id."""
+    lookup: dict[str, int] = {}
     for _, row in df.iterrows():
-        lookup[row["canonical"].strip().lower()] = row["id"]
-        for v in row["variants"].split(";"):
+        lookup[row["canonical_name"].strip().lower()] = row[id_col]
+        for v in (row["variant_names"] or "").split(";"):
             v = v.strip().lower()
             if v:
-                lookup[v] = row["id"]
+                lookup[v] = row[id_col]
     return lookup
 
 
-def next_id(existing_ids: list[str], prefix: str) -> str:
-    nums = [int(i[1:]) for i in existing_ids if i.startswith(prefix) and i[1:].isdigit()]
-    return f"{prefix}{(max(nums) + 1) if nums else 1:03d}"
-
-
-def fuzzy_match(name: str, lookup: dict[str, str], authority_df: pd.DataFrame):
+def fuzzy_match(name: str, lookup: dict[str, int], authority_df: pd.DataFrame, id_col: str):
     """
-    Return (id_or_None, score, matched_canonical).
+    Return (pk_or_None, score, matched_canonical).
     Uses the RapidFuzz token_sort_ratio for tolerance of word-order variants.
+    Verbatim algorithm/thresholds from the pre-migration version -- only the
+    id type (int pk instead of string id) changed.
     """
     candidates = list(lookup.keys())
     if not candidates:
@@ -69,88 +70,103 @@ def fuzzy_match(name: str, lookup: dict[str, str], authority_df: pd.DataFrame):
     matched_key, score, _ = process.extractOne(
         name.lower(), candidates, scorer=fuzz.token_sort_ratio
     )
-    matched_id = lookup[matched_key]
-    # Retrieve canonical name for reporting
-    row = authority_df[authority_df["id"] == matched_id].iloc[0]
-    return matched_id, score, row["canonical"]
+    matched_pk = lookup[matched_key]
+    row = authority_df[authority_df[id_col] == matched_pk].iloc[0]
+    return matched_pk, score, row["canonical_name"]
 
 
-_CHARTER_YEAR_RE = re.compile(r"(\d{3,4})")
+def _current_max_legacy_num(conn, table: str, volume: int, prefix: str) -> int:
+    """Current max numeric suffix among source_volume=volume legacy_ids in
+    `table` starting with `prefix` -- the DB-sourced seed for this run's
+    legacy_id numbering (replaces the old next_id()'s in-memory-list scan)."""
+    rows = conn.execute(
+        f"SELECT legacy_id FROM {table} WHERE source_volume = ? AND legacy_id LIKE ?",
+        (volume, prefix + "%"),
+    ).fetchall()
+    best = 0
+    for r in rows:
+        suffix = r["legacy_id"][len(prefix):]
+        if suffix.isdigit():
+            best = max(best, int(suffix))
+    return best
 
 
-def charter_year(date_str) -> str:
-    """Extracts the leading 3-4 digit year from a charter's extracted date
-    field (formats seen in real data: 'YYYY', 'YYYY-MM', 'YYYY-MM-DD', and
-    occasionally an uncertain range like '1265/1449' -- for the latter, the
-    first year is used as a single anchor point, not the full range)."""
-    m = _CHARTER_YEAR_RE.match((date_str or "").strip())
-    if not m:
-        return ""
-    return str(int(m.group(1)))
+class LegacyIdSeeder:
+    """Seeds legacy_id numbering once per main() invocation from the current
+    DB max (see _current_max_legacy_num), then increments purely in-memory
+    for the rest of the run -- mirrors the old next_id()'s numbering
+    convention (zero-padded to 3 digits) without re-querying the DB per
+    insert."""
+
+    def __init__(self, conn, table: str, volume: int, prefix: str):
+        self.prefix = prefix
+        self.n = _current_max_legacy_num(conn, table, volume, prefix)
+
+    def next_legacy_id(self) -> str:
+        self.n += 1
+        return f"{self.prefix}{self.n:03d}"
 
 
 def resolve_persons(
     persons: list[dict],
     persons_df: pd.DataFrame,
     persons_lookup: dict,
-    existing_ids: list[str],
+    volume: int,
+    person_seeder: LegacyIdSeeder,
+    source_ref: str,
     fuzzy_accept: int = FUZZY_ACCEPT,
     fuzzy_review: int = FUZZY_REVIEW,
     charter_year_str: str = "",
-) -> tuple[list[dict], list[dict], list[dict]]:
+) -> tuple[list[dict], list[int], list[dict]]:
     """
     Returns:
-        resolved  — [{name, role_category, qualifier, person_id, match_score}]
-        new_persons — rows to add to persons_authority (score < FUZZY_REVIEW)
-        review_items — ambiguous matches (FUZZY_REVIEW ≤ score < FUZZY_ACCEPT)
+        resolved     — [{name, role_category, qualifier, person_id, match_score}]
+                       person_id is an int person_pk, or "REVIEW:{pk}"
+        new_person_pks — pks minted for this charter (already live in the DB)
+        review_items — ambiguous matches (FUZZY_REVIEW <= score < FUZZY_ACCEPT)
     """
-    resolved, new_persons, review_items = [], [], []
-    seen_new: dict[str, str] = {}  # name → temp_id (avoid duplicating within one charter)
+    resolved, new_person_pks, review_items = [], [], []
+    seen_new: dict[str, int] = {}  # name -> pk (avoid duplicating within one charter)
+
+    floruit = db.to_int_or_none(charter_year_str)
 
     for p in persons:
         name = p.get("name", "").strip()
         if not name:
             continue
 
-        matched_id, score, canonical = fuzzy_match(name, persons_lookup, persons_df)
+        matched_pk, score, canonical = fuzzy_match(name, persons_lookup, persons_df, "person_pk")
 
         if score >= fuzzy_accept:
-            resolved.append({**p, "person_id": matched_id, "match_score": score, "matched_canonical": canonical})
+            resolved.append({**p, "person_id": matched_pk, "match_score": score, "matched_canonical": canonical})
         elif score >= fuzzy_review:
             review_items.append({
                 "type": "person", "extracted_name": name,
-                "closest_match": canonical, "match_id": matched_id, "score": score,
+                "closest_match": canonical, "match_id": matched_pk, "score": score,
                 "role_category": p.get("role_category", ""),
             })
-            resolved.append({**p, "person_id": f"REVIEW:{matched_id}", "match_score": score})
+            resolved.append({**p, "person_id": f"REVIEW:{matched_pk}", "match_score": score})
         else:
-            # New person
-            if name.lower() in seen_new:
-                pid = seen_new[name.lower()]
+            key = name.lower()
+            if key in seen_new:
+                pk = seen_new[key]
             else:
-                pid = next_id(existing_ids + [r["person_id"] for r in new_persons if not r["person_id"].startswith("REVIEW")], "p")
-                seen_new[name.lower()] = pid
-                new_persons.append({
-                    "person_id": pid,
-                    "canonical_name": name,
-                    "variant_names": "",
-                    "patronymic": "",
-                    "occupation": p.get("role_category", ""),
-                    "title": p.get("qualifier", ""),
+                legacy_id = person_seeder.next_legacy_id()
+                pk = db.insert_provisional_person(
+                    volume, legacy_id, name,
+                    occupation=p.get("role_category") or "",
+                    title=p.get("qualifier") or "",
                     # Single-point anchor from the charter's own date, not a
                     # true attested lifespan -- cross-charter matching tools
                     # apply their own +/- tolerance on top of this.
-                    "floruit_start": charter_year_str,
-                    "floruit_end": charter_year_str,
-                    "gender": "",
-                    "associated_places": "",
-                    "notes": "",
-                    "sources": "",
-                    "_extracted_role": p.get("role_category", ""),
-                })
-            resolved.append({**p, "person_id": pid, "match_score": 0, "matched_canonical": ""})
+                    floruit_start=floruit, floruit_end=floruit,
+                    sources=source_ref,
+                )
+                seen_new[key] = pk
+                new_person_pks.append(pk)
+            resolved.append({**p, "person_id": pk, "match_score": 0, "matched_canonical": ""})
 
-    return resolved, new_persons, review_items
+    return resolved, new_person_pks, review_items
 
 
 def _new_place_name_forms(entry: dict) -> list[str]:
@@ -168,32 +184,36 @@ def _new_place_name_forms(entry: dict) -> list[str]:
     return out
 
 
-def _match_existing_new_place(name: str, new_places: list[dict], threshold: int) -> tuple[str | None, int]:
+def _match_existing_new_place(name: str, new_places: list[dict], threshold: int) -> tuple[int | None, int]:
     """
     Fuzzy-check `name` against every place already minted as NEW earlier in
     this same charter (new_places is charter-scoped inside resolve_places()).
-    Returns (place_id, score) of the best match at/above `threshold`, else (None, 0).
+    Returns (place_pk, score) of the best match at/above `threshold`, else (None, 0).
     """
-    best_id, best_score = None, 0
+    best_pk, best_score = None, 0
     key = _PAREN_TAIL.sub("", name).strip().lower() or name.strip().lower()
     for entry in new_places:
         for form in _new_place_name_forms(entry):
             score = fuzz.token_sort_ratio(key, form)
             if score > best_score:
-                best_score, best_id = score, entry["place_id"]
-    return (best_id, best_score) if best_score >= threshold else (None, 0)
+                best_score, best_pk = score, entry["place_pk"]
+    return (best_pk, best_score) if best_score >= threshold else (None, 0)
 
 
-def _record_variant(new_places: list[dict], place_id: str, spelling: str) -> None:
+def _record_variant(new_places: list[dict], place_pk: int, spelling: str) -> None:
     """Append a newly-discovered alternate spelling to the matched new place's
-    variant_names, so a later differently-spelled mention of the same place
-    (within this charter) has more name forms to match against."""
+    variant_names, both in the in-memory accumulator (so later mentions in
+    this same charter have more name forms to match against) and onto the
+    already-inserted DB row via db.update_place() (the row is live in the DB
+    the moment it's minted, unlike the old CSV pipeline where it only existed
+    as an in-memory dict until 05 wrote it out)."""
     for entry in new_places:
-        if entry["place_id"] == place_id:
+        if entry["place_pk"] == place_pk:
             existing = [v for v in (entry.get("variant_names") or "").split(";") if v.strip()]
             if spelling not in existing:
                 existing.append(spelling)
             entry["variant_names"] = ";".join(existing)
+            db.update_place(place_pk, variant_names=entry["variant_names"])
             return
 
 
@@ -202,63 +222,65 @@ def resolve_places(
     all_places: list[str],
     places_df: pd.DataFrame,
     places_lookup: dict,
-    existing_ids: list[str],
+    volume: int,
+    place_seeder: LegacyIdSeeder,
+    source_ref: str,
     place_auth: PlaceAuthority | None = None,
     fuzzy_accept: int = FUZZY_ACCEPT,
     fuzzy_review: int = FUZZY_REVIEW,
     new_place_dedup: int = NEW_PLACE_DEDUP_THRESHOLD,
-) -> tuple[list[dict], list[dict], list[dict]]:
-    resolved, new_places, review_items = [], [], []
-    seen_new: dict[str, str] = {}
+) -> tuple[list[dict], list[int], list[dict]]:
+    resolved, review_items = [], []
+    seen_new: dict[str, int] = {}
+    # Charter-scoped accumulator of places minted as NEW so far in this
+    # charter -- only compared against each other (NEW_PLACE_DEDUP_THRESHOLD),
+    # never against the whole DB. Holds {"place_pk", "canonical_name",
+    # "variant_names"} now that rows are already live in the DB.
+    new_place_entries: list[dict] = []
 
     def resolve_one(name: str, role: str, region: str):
-        # Pass 0: check place_names_authority.csv (exact match, highest confidence)
+        # Pass 0: check places WHERE status='canonical' (exact match, highest confidence)
         if place_auth:
             entry = place_auth.lookup(name)
             if entry:
                 return {"name": name, "role": role, "region": region,
-                        "place_id": entry.place_id, "match_score": 100,
-                        "matched_canonical": entry.canonical_name}, None, None
+                        "place_id": entry.place_pk, "match_score": 100,
+                        "matched_canonical": entry.canonical_name}, None
 
-        matched_id, score, canonical = fuzzy_match(name, places_lookup, places_df)
+        matched_pk, score, canonical = fuzzy_match(name, places_lookup, places_df, "place_pk")
         if score >= fuzzy_accept:
             return {"name": name, "role": role, "region": region,
-                    "place_id": matched_id, "match_score": score, "matched_canonical": canonical}, None, None
+                    "place_id": matched_pk, "match_score": score, "matched_canonical": canonical}, None
         elif score >= fuzzy_review:
             review = {"type": "place", "extracted_name": name,
-                      "closest_match": canonical, "match_id": matched_id, "score": score, "role": role}
+                      "closest_match": canonical, "match_id": matched_pk, "score": score, "role": role}
             return {"name": name, "role": role, "region": region,
-                    "place_id": f"REVIEW:{matched_id}", "match_score": score}, review, None
+                    "place_id": f"REVIEW:{matched_pk}", "match_score": score}, review
         else:
-            if name.lower() in seen_new:
-                pid = seen_new[name.lower()]
+            key = name.lower()
+            if key in seen_new:
+                pk = seen_new[key]
             else:
-                dup_id, _dup_score = _match_existing_new_place(name, new_places, new_place_dedup)
-                if dup_id is not None:
-                    pid = dup_id
-                    seen_new[name.lower()] = pid
-                    _record_variant(new_places, pid, name)
+                dup_pk, _dup_score = _match_existing_new_place(name, new_place_entries, new_place_dedup)
+                if dup_pk is not None:
+                    pk = dup_pk
+                    seen_new[key] = pk
+                    _record_variant(new_place_entries, pk, name)
                 else:
-                    pid = next_id(existing_ids + [r["place_id"] for r in new_places], "l")
-                    seen_new[name.lower()] = pid
-                    new_places.append({
-                        "place_id": pid,
-                        "canonical_name": name,
-                        "variant_names": "",
-                        "place_type": "",
-                        "coordinates_lat": "",
-                        "coordinates_long": "",
-                        "region": region,
-                        "district": "",
-                        "modern_equivalent": "",
-                        "notes": "",
-                        "sources": "",
+                    legacy_id = place_seeder.next_legacy_id()
+                    pk = db.insert_provisional_place(
+                        volume, legacy_id, name,
+                        region=region or "", sources=source_ref,
+                    )
+                    seen_new[key] = pk
+                    new_place_entries.append({
+                        "place_pk": pk, "canonical_name": name, "variant_names": "",
                     })
             return {"name": name, "role": role, "region": region,
-                    "place_id": pid, "match_score": 0}, None, True
+                    "place_id": pk, "match_score": 0}, None
 
     for loc in locations:
-        r, review, _ = resolve_one(loc.get("name", ""), loc.get("role", "loc.mentioned"), loc.get("region", ""))
+        r, review = resolve_one(loc.get("name", ""), loc.get("role", "loc.mentioned"), loc.get("region", ""))
         resolved.append(r)
         if review:
             review_items.append(review)
@@ -267,20 +289,21 @@ def resolve_places(
     already_named = {loc.get("name", "").lower() for loc in locations}
     for name in all_places:
         if name.lower() not in already_named:
-            r, review, _ = resolve_one(name, "loc.mentioned", "")
+            r, review = resolve_one(name, "loc.mentioned", "")
             resolved.append(r)
             if review:
                 review_items.append(review)
             already_named.add(name.lower())
 
-    return resolved, new_places, review_items
+    new_place_pks = [e["place_pk"] for e in new_place_entries]
+    return resolved, new_place_pks, review_items
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Resolve entities against authority files.")
+    parser = argparse.ArgumentParser(description="Resolve entities against the persons/places tables.")
     parser.add_argument("--vol", type=int, required=True)
     parser.add_argument("--fuzzy-accept", type=int, default=FUZZY_ACCEPT,
-                        help=f"Min score to auto-assign an existing ID (default: {FUZZY_ACCEPT})")
+                        help=f"Min score to auto-assign an existing pk (default: {FUZZY_ACCEPT})")
     parser.add_argument("--fuzzy-review", type=int, default=FUZZY_REVIEW,
                         help=f"Min score to flag for manual review (default: {FUZZY_REVIEW})")
     args = parser.parse_args()
@@ -295,19 +318,23 @@ def main():
     with open(raw_path, encoding="utf-8") as f:
         charters = json.load(f)
 
-    persons_df  = load_authority("persons_authority", "person_id", "canonical_name", "variant_names")
-    places_df   = load_authority("Places_Authority",  "place_id",  "canonical_name", "variant_names")
-    persons_lookup = build_lookup(persons_df)
-    places_lookup  = build_lookup(places_df)
+    persons_df = db.get_persons(status="canonical")
+    places_df = db.get_places(status="canonical")
+    persons_lookup = build_lookup(persons_df, "person_pk")
+    places_lookup = build_lookup(places_df, "place_pk")
 
-    place_auth = PlaceAuthority()  # loads place_names_authority.csv if present
+    place_auth = PlaceAuthority()  # in-memory index over places WHERE status='canonical'
 
-    existing_person_ids = persons_df["id"].tolist()
-    existing_place_ids  = places_df["id"].tolist()
+    conn = db.get_connection()
+    try:
+        person_seeder = LegacyIdSeeder(conn, "persons", args.vol, "p")
+        place_seeder = LegacyIdSeeder(conn, "places", args.vol, "l")
+    finally:
+        conn.close()
 
     resolved_charters = []
-    all_new_persons: list[dict] = []
-    all_new_places: list[dict] = []
+    all_new_person_pks: list[int] = []
+    all_new_place_pks: list[int] = []
     all_review_items: list[dict] = []
 
     for ch in charters:
@@ -315,29 +342,20 @@ def main():
             resolved_charters.append({**ch, "_skipped": True})
             continue
 
-        # Track new IDs accumulated so far to avoid collisions across charters
-        running_person_ids = existing_person_ids + [p["person_id"] for p in all_new_persons]
-        running_place_ids  = existing_place_ids  + [p["place_id"]  for p in all_new_places]
+        source_ref = f"DI vol.{args.vol} seq.{ch.get('sequence','?')} | {ch.get('di_reference','')}"
 
-        res_persons, new_p, rev_p = resolve_persons(
-            ch.get("persons", []), persons_df, persons_lookup, running_person_ids,
-            fuzzy_accept=fa, fuzzy_review=fr, charter_year_str=charter_year(ch.get("date")),
+        res_persons, new_p_pks, rev_p = resolve_persons(
+            ch.get("persons", []), persons_df, persons_lookup, args.vol, person_seeder, source_ref,
+            fuzzy_accept=fa, fuzzy_review=fr, charter_year_str=db.charter_year(ch.get("date")),
         )
-        res_places, new_l, rev_l = resolve_places(
+        res_places, new_l_pks, rev_l = resolve_places(
             ch.get("locations", []), ch.get("all_places_mentioned", []),
-            places_df, places_lookup, running_place_ids, place_auth,
+            places_df, places_lookup, args.vol, place_seeder, source_ref, place_auth,
             fuzzy_accept=fa, fuzzy_review=fr,
         )
 
-        # Add charter source reference to new entries
-        source_ref = f"DI vol.{args.vol} seq.{ch.get('sequence','?')} | {ch.get('di_reference','')}"
-        for p in new_p:
-            p["sources"] = source_ref
-        for l in new_l:
-            l["sources"] = source_ref
-
-        all_new_persons.extend(new_p)
-        all_new_places.extend(new_l)
+        all_new_person_pks.extend(new_p_pks)
+        all_new_place_pks.extend(new_l_pks)
         all_review_items.extend([{**r, "charter_filename": ch["filename"], "charter_date": ch.get("date", "")}
                                   for r in rev_p + rev_l])
 
@@ -345,8 +363,8 @@ def main():
             **ch,
             "resolved_persons": res_persons,
             "resolved_locations": res_places,
-            "new_persons": [p["person_id"] for p in new_p],
-            "new_places": [l["place_id"] for l in new_l],
+            "new_persons": new_p_pks,
+            "new_places": new_l_pks,
         })
 
     # Save resolved JSON
@@ -354,7 +372,10 @@ def main():
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(resolved_charters, f, ensure_ascii=False, indent=2)
 
-    # Save review queue CSV
+    # Save review queue CSV -- unchanged shape from before the SQLite migration.
+    # DB wiring of review_queue_items (direct FKs to charter_persons/charter_places)
+    # is deferred to a later phase; this CSV remains the only review-queue
+    # output this script produces.
     REVIEW_DIR.mkdir(parents=True, exist_ok=True)
     review_path = REVIEW_DIR / f"vol{args.vol:02d}_review_queue.csv"
     if all_review_items:
@@ -367,7 +388,7 @@ def main():
             writer.writerows(all_review_items)
 
     print(f"Resolved {len(resolved_charters)} charters.")
-    print(f"  {len(all_new_persons)} new persons  |  {len(all_new_places)} new places")
+    print(f"  {len(all_new_person_pks)} new persons  |  {len(all_new_place_pks)} new places")
     print(f"  {len(all_review_items)} items flagged for manual review → {review_path}")
     print(f"Saved: {out_path}")
 

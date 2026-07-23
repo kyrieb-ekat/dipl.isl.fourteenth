@@ -5,21 +5,18 @@ Usage:
     python 04_lookup_coords.py --vol 1
     python 04_lookup_coords.py --vol 1 --country Q189   # Q189 = Iceland (default)
 
-Reads:  output/review/vol{N}_places_new.csv  (produced by 05_export_csvs.py)
-        OR you can pass --places-csv directly for standalone use.
-
-Writes: output/review/vol{N}_places_new_geocoded.csv
-        — same file with coordinates filled where Wikidata matched confidently
-        — a match_score column lets you filter/verify before merging
+Reads:  places table (status='provisional', source_volume=N) in charter_pipeline.db
+Writes: same rows, in place, via db.update_place_geocoding()
+        — coordinates filled where Wikidata matched confidently
+        — geo_match_score lets you filter/verify before promotion
 
 Notes:
   - Only places with empty coordinates_lat are queried.
-  - Matches with fuzzy score < 70 are left blank (coordinates_lat = "REVIEW").
-  - No coordinates are written without your manual approval (use 06_merge_into_xlsx.py).
+  - Matches with fuzzy score < 70 are left blank.
+  - No coordinates are written without your manual approval (Final Review).
 """
 
 import argparse
-import csv
 import sys
 import time
 from pathlib import Path
@@ -28,7 +25,7 @@ from rapidfuzz import fuzz, process
 from SPARQLWrapper import JSON, SPARQLWrapper
 
 sys.path.insert(0, str(Path(__file__).parent))
-from config import REVIEW_DIR
+import db
 
 WIKIDATA_ENDPOINT = "https://query.wikidata.org/sparql"
 GEO_ACCEPT_SCORE = 70  # fuzzy threshold for auto-accepting a Wikidata match
@@ -97,27 +94,17 @@ def match_place(name: str, wd_places: list[dict]) -> tuple[str, str, str, int]:
 
 def main():
     parser = argparse.ArgumentParser(description="Geocode new places via Wikidata SPARQL.")
-    parser.add_argument("--vol", type=int, help="Volume number (used to find places CSV automatically).")
-    parser.add_argument("--places-csv", type=Path, help="Direct path to a places CSV to geocode.")
+    parser.add_argument("--vol", type=int, required=True, help="Volume number.")
     args = parser.parse_args()
 
-    if args.places_csv:
-        in_path = args.places_csv
-    elif args.vol:
-        in_path = REVIEW_DIR / f"vol{args.vol:02d}_places_new.csv"
-    else:
-        print("Error: provide --vol or --places-csv.", file=sys.stderr)
+    df = db.get_places(status="provisional", source_volume=args.vol)
+    if df.empty:
+        print(f"No provisional places found for vol{args.vol:02d}. Run 05_export_csvs.py first.",
+              file=sys.stderr)
         sys.exit(1)
 
-    if not in_path.exists():
-        print(f"Error: {in_path} not found. Run 05_export_csvs.py first.", file=sys.stderr)
-        sys.exit(1)
-
-    with open(in_path, encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-
-    ungeocoded = [r for r in rows if not r.get("coordinates_lat", "").strip()]
-    if not ungeocoded:
+    ungeocoded = df[df["coordinates_lat"].isna()]
+    if ungeocoded.empty:
         print("All places already have coordinates. Nothing to do.")
         return
 
@@ -125,41 +112,21 @@ def main():
     wd_places = query_iceland_places()
 
     matched_count = 0
-    for row in rows:
-        if row.get("coordinates_lat", "").strip():
-            row["wikidata_id"] = row.get("wikidata_id", "")
-            row["geo_match_score"] = ""
-            continue
-
+    for row in ungeocoded.to_dict("records"):
         lat, long, wdid, score = match_place(row["canonical_name"], wd_places)
         if score >= GEO_ACCEPT_SCORE:
-            row["coordinates_lat"]  = lat
-            row["coordinates_long"] = long
-            row["wikidata_id"]      = wdid
-            row["geo_match_score"]  = score
+            db.update_place_geocoding(row["place_pk"], coordinates_lat=float(lat),
+                                       coordinates_long=float(long), wikidata_id=wdid,
+                                       geo_match_score=score)
             matched_count += 1
         else:
-            row["coordinates_lat"]  = ""
-            row["coordinates_long"] = ""
-            row["wikidata_id"]      = wdid if wdid else ""
-            row["geo_match_score"]  = score if score else ""
-
+            db.update_place_geocoding(row["place_pk"], wikidata_id=(wdid or None),
+                                       geo_match_score=(score or None))
         time.sleep(0.05)  # be polite to Wikidata
-
-    out_path = in_path.with_name(in_path.stem + "_geocoded.csv")
-    fieldnames = list(rows[0].keys())
-    for extra in ["wikidata_id", "geo_match_score"]:
-        if extra not in fieldnames:
-            fieldnames.append(extra)
-
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
 
     print(f"Geocoded {matched_count}/{len(ungeocoded)} places automatically.")
     print(f"Remaining {len(ungeocoded) - matched_count} need manual lookup.")
-    print(f"Review: {out_path}")
+    print(f"Updated vol{args.vol:02d} places in charter_pipeline.db.")
     print("\nTip: Filter geo_match_score < 85 for careful manual verification.")
 
 

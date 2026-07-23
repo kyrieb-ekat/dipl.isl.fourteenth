@@ -1,131 +1,87 @@
 """
-Step 5: Export per-volume review CSVs from resolved entity data.
+Step 5: Load resolved entity data into the DB's charters/charter_persons/
+charter_places tables.
 
 Usage:
     python 05_export_csvs.py --vol 1
+    python 05_export_csvs.py --vol 1 --force   # replace an already-loaded volume
 
 Reads:  output/entities/vol{N}_resolved_entities.json
 
-Writes (all in output/review/):
-    vol{N}_charters.csv       — one row per charter, for review before merging into Charter_Data
-    vol{N}_persons_new.csv    — candidate new person rows (to add to persons_authority)
-    vol{N}_places_new.csv     — candidate new place rows (to add to Places_Authority)
-    vol{N}_review_queue.csv   — ambiguous matches requiring manual decision
+Writes: charter_pipeline.db -- one charters row per charter, one
+        charter_persons/charter_places row per resolved_persons/
+        resolved_locations entry. Persons/places themselves are NOT minted
+        here -- 03_resolve_entities.py already inserted them directly into
+        the DB at resolution time (see that script's module docstring);
+        this step wires up the junction rows and, for pending-review
+        entries, both the review_match_person_pk/review_match_place_pk
+        pointer AND a review_queue_items row (so the Review Queue tab shows
+        a freshly-processed volume's ambiguous matches immediately, not
+        just already-migrated volumes whose review_queue_items came from
+        migrate_to_sqlite.py's one-time positional-join pass).
 
-These CSVs are meant for you to review, edit, and approve.
-Only approved rows are merged into the XLSX by 06_merge_into_xlsx.py.
+Not idempotent by design (matches the old CSV pipeline's behavior of
+overwriting output files whole): re-running for a volume that already has
+charters in the DB is an error unless --force is passed, since
+charters.UNIQUE(volume, sequence) would otherwise raise on every row.
 """
 
 import argparse
-import csv
 import json
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from config import ENTITIES_DIR, REVIEW_DIR
+from config import ENTITIES_DIR
+import db
 
 
-def flatten_persons(resolved_persons: list[dict]) -> dict[str, str]:
-    """
-    Build columns matching your raw extraction format:
-        persons_by_role: "priest-issuer: Jón Koðrason; layman-issuer: Geirr Þorsteinsson; ..."
-        grantor_id / recipient_id: first matching person_id (for Charter_Data FK columns)
-    """
-    by_role: dict[str, list[str]] = defaultdict(list)
-    grantor_id = ""
-    recipient_id = ""
-
-    for p in resolved_persons:
-        role = p.get("role_category", "unknown")
-        name = p.get("name", "")
-        pid  = p.get("person_id", "")
-        display = f"{name} [{pid}]" if pid else name
-        by_role[role].append(display)
-
-        if not grantor_id and "issuer" in role:
-            grantor_id = pid
-        if not recipient_id and role == "recipient":
-            recipient_id = pid
-
-    persons_str = "; ".join(f"{role}: {', '.join(names)}" for role, names in by_role.items())
-    return {
-        "persons_by_role": persons_str,
-        "grantor_id": grantor_id,
-        "recipient_id": recipient_id,
-    }
+def _str_or_blank(v) -> str:
+    return "" if v is None else str(v)
 
 
-def flatten_locations(resolved_locations: list[dict]) -> dict[str, str]:
-    loc_writing = ""
-    loc_hearing = ""
-    loc_writing_id = ""
-    loc_hearing_id = ""
-    all_ids = []
-
-    for loc in resolved_locations:
-        role = loc.get("role", "")
-        name = loc.get("name", "")
-        pid  = loc.get("place_id", "")
-        region = loc.get("region", "")
-        display = f"{name} ({region})" if region else name
-        if pid:
-            all_ids.append(pid)
-
-        if role == "loc.writing" and not loc_writing:
-            loc_writing = display
-            loc_writing_id = pid
-        elif role == "loc.hearing" and not loc_hearing:
-            loc_hearing = display
-            loc_hearing_id = pid
-
-    return {
-        "location_written": loc_writing,
-        "location_written_id": loc_writing_id,
-        "location_hearing": loc_hearing,
-        "location_hearing_id": loc_hearing_id,
-        "locations_mentioned_ids": "; ".join(dict.fromkeys(all_ids)),  # deduplicated, ordered
-    }
+def _parse_ref(raw_id) -> tuple[int | None, int | None]:
+    """raw_id is an int person_pk/place_pk (as written by 03_resolve_entities.py),
+    a "REVIEW:{pk}" string, or None/''. Returns (pk, review_candidate_pk) --
+    exactly one of the two is non-None (or both None for a blank id)."""
+    if isinstance(raw_id, str) and raw_id.startswith("REVIEW:"):
+        return None, int(raw_id.split(":", 1)[1])
+    if raw_id in (None, ""):
+        return None, None
+    return int(raw_id), None
 
 
-CHARTER_FIELDS = [
-    # Identifiers / source
-    "charter_id_placeholder", "volume", "sequence", "page_start",
-    "shelfmark_auto",         # auto-constructed; verify against physical shelfmark
-    "di_reference",
-    # Core data
-    "date", "date_uncertain", "date_header",
-    "doc_type", "subject", "outcome",
-    # Persons
-    "scribe", "scribe_source",
-    "grantor_id", "recipient_id", "persons_by_role",
-    # Locations
-    "location_written", "location_written_id",
-    "location_hearing", "location_hearing_id",
-    "locations_mentioned_ids",
-    # Other
-    "seal_info", "language", "notes",
-    # Flags for your review
-    "_has_parse_error", "_has_review_persons", "_has_review_places",
-]
-
-PERSON_FIELDS = [
-    "person_id", "canonical_name", "variant_names", "patronymic",
-    "occupation", "title", "floruit_start", "floruit_end",
-    "gender", "associated_places", "notes", "sources",
-]
-
-PLACE_FIELDS = [
-    "place_id", "canonical_name", "variant_names", "place_type",
-    "coordinates_lat", "coordinates_long", "region", "district",
-    "modern_equivalent", "notes", "sources",
-]
+def _delete_volume_charters(volume: int) -> int:
+    """Removes every charters row (and, via ON DELETE CASCADE, every
+    charter_persons/charter_places row) for `volume`. Does NOT touch
+    persons/places themselves -- they may be referenced elsewhere (e.g.
+    already promoted to canonical, or referenced by another volume after a
+    merge). Also clears any review_queue_items rows pointing at this
+    volume's charters first: schema.sql gives charter_persons/charter_places
+    ON DELETE CASCADE from charters, but NOT review_queue_items -- with
+    PRAGMA foreign_keys=ON (set by db.get_connection()), deleting charters
+    that still have queue rows pointing at them would otherwise raise a
+    foreign key constraint error (a real scenario for a volume that already
+    has queue rows from the original CSV-to-SQLite migration)."""
+    conn = db.get_connection()
+    try:
+        with conn:
+            n = conn.execute("SELECT COUNT(*) FROM charters WHERE volume=?", (volume,)).fetchone()[0]
+            conn.execute(
+                "DELETE FROM review_queue_items WHERE charter_pk IN "
+                "(SELECT charter_pk FROM charters WHERE volume=?)", (volume,),
+            )
+            conn.execute("DELETE FROM charters WHERE volume=?", (volume,))
+        return n
+    finally:
+        conn.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export per-volume review CSVs.")
+    parser = argparse.ArgumentParser(description="Load resolved entities into charters/charter_persons/charter_places.")
     parser.add_argument("--vol", type=int, required=True)
+    parser.add_argument("--force", action="store_true",
+                         help="Delete this volume's existing charters (and junction rows) before re-inserting.")
     args = parser.parse_args()
 
     resolved_path = ENTITIES_DIR / f"vol{args.vol:02d}_resolved_entities.json"
@@ -136,111 +92,99 @@ def main():
     with open(resolved_path, encoding="utf-8") as f:
         charters = json.load(f)
 
-    REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    existing = db.get_charters(volume=args.vol)
+    if len(existing) > 0:
+        if not args.force:
+            print(
+                f"Error: vol{args.vol:02d} already has {len(existing)} charter(s) in the database -- "
+                f"re-running 05_export_csvs.py would create duplicates; this script is not idempotent "
+                f"by design, matching the old CSV pipeline's behavior of overwriting output files whole. "
+                f"Pass --force to delete the existing rows and re-insert.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        removed = _delete_volume_charters(args.vol)
+        print(f"--force: removed {removed} existing charter(s) (and their junction rows) for vol{args.vol:02d}.")
 
-    charter_rows = []
-    new_persons_seen: dict[str, dict] = {}
-    new_places_seen:  dict[str, dict] = {}
+    n_charters = n_persons = n_places = n_review_persons = n_review_places = 0
 
     for ch in charters:
         has_error = "_parse_error" in ch or "_api_error" in ch
+        sequence = ch.get("sequence")
 
-        person_flat = flatten_persons(ch.get("resolved_persons", []))
-        loc_flat    = flatten_locations(ch.get("resolved_locations", []))
+        charter_pk = db.create_charter(
+            args.vol, sequence,
+            date=ch.get("date") or "",
+            doc_type=ch.get("doc_type") or "",
+            subject=ch.get("subject") or "",
+            outcome=ch.get("outcome") or "",
+            scribe=ch.get("scribe") or "",
+            scribe_source=ch.get("scribe_source") or "",
+            seal_info=ch.get("seal_info") or "",
+            language=ch.get("language") or "",
+            notes=ch.get("_parse_error") or ch.get("_api_error") or "",
+            shelfmark_auto=f"DI Bindi {args.vol}, seq. {ch.get('sequence', '?')} (p.{ch.get('page_start', '?')})",
+            di_reference=ch.get("di_reference") or "",
+            date_uncertain=_str_or_blank(ch.get("date_uncertain")),
+            date_header=ch.get("date_header") or "",
+            has_parse_error=has_error,
+        )
+        n_charters += 1
 
-        has_review_p = any("REVIEW:" in p.get("person_id", "") for p in ch.get("resolved_persons", []))
-        has_review_l = any("REVIEW:" in l.get("place_id", "")  for l in ch.get("resolved_locations", []))
+        for ordinal, p in enumerate(ch.get("resolved_persons", [])):
+            pk, review_pk = _parse_ref(p.get("person_id"))
+            resolution_state = "pending_review" if review_pk is not None else "resolved"
+            if resolution_state == "pending_review":
+                n_review_persons += 1
+            charter_person_pk = db.add_charter_person(
+                charter_pk, ordinal,
+                p.get("role_category") or "", p.get("name") or "",
+                person_pk=pk, resolution_state=resolution_state,
+                review_match_person_pk=review_pk, match_score=p.get("match_score"),
+                qualifier=p.get("qualifier") or "",
+            )
+            n_persons += 1
+            if resolution_state == "pending_review":
+                match_row = db.get_person_by_pk(review_pk)
+                db.create_review_item(
+                    "person", charter_pk, p.get("name") or "", review_pk, p.get("match_score"),
+                    charter_person_pk=charter_person_pk, role_category=p.get("role_category") or "",
+                    closest_match=match_row["canonical_name"] if match_row else "",
+                    charter_date=ch.get("date") or "",
+                )
 
-        row = {
-            "charter_id_placeholder": f"c_vol{args.vol:02d}_seq{ch.get('sequence', '?'):04}" if isinstance(ch.get('sequence'), int) else f"c_vol{args.vol:02d}_seq{ch.get('sequence', '?')}",
-            "volume":       ch.get("volume", ""),
-            "sequence":     ch.get("sequence", ""),
-            "page_start":   ch.get("page_start", ""),
-            "shelfmark_auto": f"DI Bindi {args.vol}, seq. {ch.get('sequence', '?')} (p.{ch.get('page_start', '?')})",
-            "di_reference": ch.get("di_reference", ""),
-            "date":         ch.get("date", ""),
-            "date_uncertain": ch.get("date_uncertain", ""),
-            "date_header":  ch.get("date_header", ""),
-            "doc_type":     ch.get("doc_type", ""),
-            "subject":      ch.get("subject", ""),
-            "outcome":      ch.get("outcome", ""),
-            "scribe":       ch.get("scribe", ""),
-            "scribe_source": ch.get("scribe_source", ""),
-            "seal_info":    ch.get("seal_info", ""),
-            "language":     ch.get("language", ""),
-            "notes":        ch.get("_parse_error", "") or ch.get("_api_error", ""),
-            "_has_parse_error":    "Y" if has_error else "",
-            "_has_review_persons": "Y" if has_review_p else "",
-            "_has_review_places":  "Y" if has_review_l else "",
-            **person_flat,
-            **loc_flat,
-        }
-        charter_rows.append(row)
+        for ordinal, loc in enumerate(ch.get("resolved_locations", [])):
+            pk, review_pk = _parse_ref(loc.get("place_id"))
+            resolution_state = "pending_review" if review_pk is not None else "resolved"
+            if resolution_state == "pending_review":
+                n_review_places += 1
+            charter_place_pk = db.add_charter_place(
+                charter_pk, ordinal,
+                loc.get("role") or "", loc.get("name") or "",
+                place_pk=pk, resolution_state=resolution_state,
+                review_match_place_pk=review_pk, match_score=loc.get("match_score"),
+                region=loc.get("region") or "",
+            )
+            n_places += 1
+            if resolution_state == "pending_review":
+                match_row = db.get_place_by_pk(review_pk)
+                db.create_review_item(
+                    "place", charter_pk, loc.get("name") or "", review_pk, loc.get("match_score"),
+                    charter_place_pk=charter_place_pk, role=loc.get("role") or "",
+                    closest_match=match_row["canonical_name"] if match_row else "",
+                    charter_date=ch.get("date") or "",
+                )
 
-        # Collect new persons and places (deduplicated across charters)
-        for p in ch.get("resolved_persons", []):
-            pid = p.get("person_id", "")
-            if pid and not pid.startswith("REVIEW:") and not pid.startswith("p"):
-                # This is a genuinely new person (temp ID starting with p is still new if not in authority)
-                pass
-        # Pull new persons/places from the raw resolved data
-        for pid in ch.get("new_persons", []):
-            if pid not in new_persons_seen:
-                # Find the person data in resolved_persons
-                for p in ch.get("resolved_persons", []):
-                    if p.get("person_id") == pid:
-                        new_persons_seen[pid] = {
-                            "person_id": pid,
-                            "canonical_name": p.get("name", ""),
-                            "variant_names": "",
-                            "patronymic": "",
-                            "occupation": p.get("role_category", ""),
-                            "title": p.get("qualifier", "") or "",
-                            "floruit_start": "",
-                            "floruit_end": "",
-                            "gender": "",
-                            "associated_places": "",
-                            "notes": "",
-                            "sources": ch.get("di_reference", ""),
-                        }
-                        break
+    flags = db.rescan_review_flags(args.vol)
 
-        for lid in ch.get("new_places", []):
-            if lid not in new_places_seen:
-                for loc in ch.get("resolved_locations", []):
-                    if loc.get("place_id") == lid:
-                        new_places_seen[lid] = {
-                            "place_id": lid,
-                            "canonical_name": loc.get("name", ""),
-                            "variant_names": "",
-                            "place_type": "",
-                            "coordinates_lat": "",
-                            "coordinates_long": "",
-                            "region": loc.get("region", ""),
-                            "district": "",
-                            "modern_equivalent": "",
-                            "notes": "",
-                            "sources": ch.get("di_reference", ""),
-                        }
-                        break
-
-    def write_csv(path: Path, rows: list[dict], fields: list[str]):
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
-        print(f"  → {path.name}  ({len(rows)} rows)")
-
-    prefix = f"vol{args.vol:02d}"
-    write_csv(REVIEW_DIR / f"{prefix}_charters.csv",     charter_rows,                    CHARTER_FIELDS)
-    write_csv(REVIEW_DIR / f"{prefix}_persons_new.csv",  list(new_persons_seen.values()), PERSON_FIELDS)
-    write_csv(REVIEW_DIR / f"{prefix}_places_new.csv",   list(new_places_seen.values()),  PLACE_FIELDS)
-
-    print(f"\nDone. Review CSVs in {REVIEW_DIR}")
-    print("Next steps:")
-    print("  1. Open and review each CSV.")
+    print(f"Loaded {n_charters} charter(s) for vol{args.vol:02d} into the database.")
+    print(f"  {n_persons} charter_persons row(s) ({n_review_persons} pending review)")
+    print(f"  {n_places} charter_places row(s) ({n_review_places} pending review)")
+    print(f"  rescan_review_flags: {flags}")
+    print("\nNext steps:")
+    print("  1. Resolve any pending_review rows (Review Queue tab / db.apply_review_decision).")
     print("  2. Run 04_lookup_coords.py to geocode new places.")
-    print("  3. When satisfied, run 06_merge_into_xlsx.py to merge approved rows into the XLSX.")
+    print("  3. When satisfied, promote eligible new entities to canonical status.")
 
 
 if __name__ == "__main__":

@@ -1,50 +1,40 @@
 """
-Loader for person_names_authority.csv.
+In-memory index over the canonical persons table in charter_pipeline.db.
 
-Authority file column layout:
-    person_id, canonical_name, wikidata_id, variants,
-    patronymic, occupation, title, floruit_start, floruit_end, gender, notes
-
-Provides a PersonAuthority object for exact and variant-name lookups,
-mirroring the PlaceAuthority pattern in place_authority.py.
+Same public interface as before the SQLite migration (PersonEntry,
+PersonAuthority with .entries/.lookup()/.lookup_wikidata()/.find(),
+split_variants()) so 03_resolve_entities.py and any other existing caller
+needs no changes -- only the backing store moved from
+person_names_authority.csv to the `persons` table (status='canonical').
 """
 
-import csv
-import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-AUTHORITY_PATH = Path(__file__).parent / "person_names_authority.csv"
+import pandas as pd
 
-_PAREN_TAIL = re.compile(r'\s*\([^)]*\)\s*$')
+sys.path.insert(0, str(Path(__file__).parent))
+import db
+from db import _PAREN_TAIL, split_variants  # re-exported for backward compatibility
 
 
-def split_variants(raw: str) -> list[str]:
-    """Split on semicolons that are NOT inside parentheses."""
-    parts: list[str] = []
-    depth = 0
-    buf: list[str] = []
-    for ch in (raw or ""):
-        if ch == '(':
-            depth += 1
-        elif ch == ')':
-            depth = max(0, depth - 1)
-        elif ch == ';' and depth == 0:
-            part = ''.join(buf).strip()
-            if part:
-                parts.append(part)
-            buf = []
-            continue
-        buf.append(ch)
-    part = ''.join(buf).strip()
-    if part:
-        parts.append(part)
-    return parts
+def _int_or_blank(v) -> str:
+    """DataFrame-sourced nullable-int columns come back as float64 with NaN
+    for NULL (pandas has no nullable-int dtype by default) -- str(v) on a
+    real NaN gives the literal string 'nan', and on a real value gives
+    '1340.0' instead of '1340'. Route every floruit_start/end read through
+    this instead of a bare str()."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    return str(int(v))
+
+AUTHORITY_PATH = Path(__file__).parent / "person_names_authority.csv"  # historical, unused post-migration
 
 
 @dataclass
 class PersonEntry:
-    person_id:      str
+    person_id:      str   # display_id
     canonical_name: str
     wikidata_id:    str = ""
     variants:       list[str] = field(default_factory=list)
@@ -55,79 +45,46 @@ class PersonEntry:
     floruit_end:    str = ""
     gender:         str = ""
     notes:          str = ""
+    person_pk:      int | None = None
 
     def all_names(self) -> list[str]:
-        """All known name forms, lowercased, with parenthetical-stripped duplicates."""
-        def _add(names: list[str], s: str) -> None:
-            s = s.strip().strip('"').strip("'").lower()
-            if s:
-                names.append(s)
-                base = _PAREN_TAIL.sub('', s).strip()
-                if base and base != s:
-                    names.append(base)
+        return db._all_names(self.canonical_name, ";".join(self.variants))
 
-        names: list[str] = []
-        _add(names, self.canonical_name)
-        for v in self.variants:
-            _add(names, v)
-        return list(dict.fromkeys(names))
+
+def _row_to_entry(row: dict) -> PersonEntry:
+    return PersonEntry(
+        person_id=row["display_id"],
+        canonical_name=row["canonical_name"],
+        wikidata_id=row.get("wikidata_id") or "",
+        variants=split_variants(row.get("variant_names", "")),
+        patronymic=row.get("patronymic") or "",
+        occupation=row.get("occupation") or "",
+        title=row.get("title") or "",
+        floruit_start=_int_or_blank(row.get("floruit_start")),
+        floruit_end=_int_or_blank(row.get("floruit_end")),
+        gender=row.get("gender") or "",
+        notes=row.get("notes") or "",
+        person_pk=row.get("person_pk"),
+    )
 
 
 class PersonAuthority:
-    """
-    In-memory index of person_names_authority.csv.
-    Lookup is exact (case-insensitive) on canonical_name and all variant forms.
-    """
+    """In-memory index over persons WHERE status='canonical'. Lookup is
+    exact (case-insensitive) on canonical_name and all variant forms."""
 
-    def __init__(self, path: Path = AUTHORITY_PATH):
-        self.entries: list[PersonEntry] = []
+    def __init__(self, path: Path | None = None):
+        # `path` accepted for signature backward-compatibility; ignored --
+        # the SQLite DB (config.DB_PATH) is the only source now.
+        df = db.get_persons(status="canonical")
+        self.entries: list[PersonEntry] = [_row_to_entry(r) for r in df.to_dict("records")]
         self._name_index: dict[str, PersonEntry] = {}
         self._wikidata_index: dict[str, PersonEntry] = {}
-        if path.exists():
-            self._load(path)
-        else:
-            print(f"[person_authority] {path.name} not found — run seed_person_names.py first.")
-
-    def _load(self, path: Path):
-        with open(path, encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            raw_fields = reader.fieldnames or []
-            norm_fields = [c.strip().lower() for c in raw_fields]
-
-            for raw_row in reader:
-                row = {norm_fields[i]: (v or "").strip()
-                       for i, (k, v) in enumerate(raw_row.items())
-                       if i < len(norm_fields)}
-
-                pid       = row.get("person_id", "").strip()
-                canonical = row.get("canonical_name", "").strip()
-                if not pid or not canonical:
-                    continue
-
-                variants = split_variants(row.get("variants", ""))
-
-                entry = PersonEntry(
-                    person_id=pid,
-                    canonical_name=canonical,
-                    wikidata_id=row.get("wikidata_id", ""),
-                    variants=variants,
-                    patronymic=row.get("patronymic", ""),
-                    occupation=row.get("occupation", ""),
-                    title=row.get("title", ""),
-                    floruit_start=row.get("floruit_start", ""),
-                    floruit_end=row.get("floruit_end", ""),
-                    gender=row.get("gender", ""),
-                    notes=row.get("notes", ""),
-                )
-                self.entries.append(entry)
-
-                for name in entry.all_names():
-                    if name and name not in self._name_index:
-                        self._name_index[name] = entry
-
-                if entry.wikidata_id and entry.wikidata_id not in self._wikidata_index:
-                    self._wikidata_index[entry.wikidata_id] = entry
-
+        for entry in self.entries:
+            for name in entry.all_names():
+                if name and name not in self._name_index:
+                    self._name_index[name] = entry
+            if entry.wikidata_id and entry.wikidata_id not in self._wikidata_index:
+                self._wikidata_index[entry.wikidata_id] = entry
         print(f"[person_authority] Loaded {len(self.entries)} entries, "
               f"{len(self._name_index)} name forms, "
               f"{len(self._wikidata_index)} Wikidata QIDs.")
@@ -140,33 +97,22 @@ class PersonAuthority:
 
     def find(self, canonical_name: str, wikidata_id: str = "",
              variant_names: list[str] | None = None) -> PersonEntry | None:
-        """
-        Multi-strategy lookup. Tries in order:
-          1. canonical_name exact match
-          1b. canonical_name with trailing parenthetical stripped
-          2. wikidata_id match
-          3. any variant_name exact match
-        """
         entry = self.lookup(canonical_name)
         if entry:
             return entry
-
         canonical_stripped = _PAREN_TAIL.sub("", canonical_name).strip()
         if canonical_stripped and canonical_stripped != canonical_name:
             entry = self.lookup(canonical_stripped)
             if entry:
                 return entry
-
         if wikidata_id:
             entry = self.lookup_wikidata(wikidata_id)
             if entry:
                 return entry
-
         for v in (variant_names or []):
             entry = self.lookup(v)
             if entry:
                 return entry
-
         return None
 
     def __len__(self):

@@ -8,13 +8,13 @@ Usage:
     python 04a_reconcile_nafnid.py --vol 4 --top-n 3
     python 04a_reconcile_nafnid.py --vol 4 --ungeocoded-only
 
-Reads:  output/review/vol{N}_places_new_geocoded.csv (falls back to
-        vol{N}_places_new.csv if the geocoded file doesn't exist yet)
-Writes: output/review/vol{N}_places_nafnid_candidates.csv
+Reads:  places table (status='provisional', source_volume=N) in charter_pipeline.db
+Writes: place_duplicate_candidates table for that volume's places
         — one row per (DI place, candidate rank) pair, blank `decision`
-        column for manual triage. Never auto-accepts a match; accepted
-        rows promote into place_names_authority.csv via the existing
-        04c_add_to_authority.py path.
+        column for manual triage (Place Duplicates tab). Never auto-accepts
+        a match; a confirmed 'same' decision backfills places.nafnid_id
+        (see db.record_place_duplicate_decision()) but does not promote
+        anything on its own -- promotion still goes through Final Review.
 
 Strategy:
   1. Normalize both sides (case, whitespace, punctuation; fold accents
@@ -58,7 +58,8 @@ from pathlib import Path
 from rapidfuzz import fuzz, process
 
 sys.path.insert(0, str(Path(__file__).parent))
-from config import NAFNID_DATA_DIR, NAFNID_LOOKUP_DIR, REVIEW_DIR
+from config import NAFNID_DATA_DIR, NAFNID_LOOKUP_DIR
+import db
 
 # ── Normalization ────────────────────────────────────────────────────────
 
@@ -162,18 +163,17 @@ def expand_sysla(label: str, crosswalk: dict) -> list:
     return crosswalk.get(label, [label])
 
 
-def load_di_mentions(review_csv: Path, ungeocoded_only: bool = False) -> list:
-    """Adapts the pipeline's real review-CSV schema (place_id,
-    canonical_name, coordinates_lat/long, region, district, ...) into the
-    shape reconcile() expects. By default carries through EVERY place,
-    not just ones Wikidata left ungeocoded — nafnid isn't just a
+def load_di_mentions(volume: int, ungeocoded_only: bool = False) -> list:
+    """Adapts the places table's rows (place_pk, canonical_name,
+    coordinates_lat/long, region, district, ...) into the shape reconcile()
+    expects. By default carries through EVERY provisional place for this
+    volume, not just ones Wikidata left ungeocoded — nafnid isn't just a
     fallback for Wikidata's misses, it may know places Wikidata never
     catalogued at all, so Wikidata-confirmed places still get a second
     opinion (pass ungeocoded_only=True to restore the narrower scope)."""
-    with open(review_csv, encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+    df = db.get_places(status="provisional", source_volume=volume)
     mentions = []
-    for r in rows:
+    for r in df.to_dict("records"):
         di_lat = try_float(r.get("coordinates_lat"))
         di_lng = try_float(r.get("coordinates_long"))
         wikidata_status = "geocoded" if di_lat is not None else "ungeocoded"
@@ -182,7 +182,7 @@ def load_di_mentions(review_csv: Path, ungeocoded_only: bool = False) -> list:
         mentions.append({
             "name": r.get("canonical_name", ""),
             "sysla": r.get("district") or r.get("region") or "",
-            "_place_id": r.get("place_id", ""),
+            "_place_id": r["place_pk"],
             "_lat": di_lat,
             "_lng": di_lng,
             "_wikidata_status": wikidata_status,
@@ -338,15 +338,38 @@ def reconcile(di_mentions, places, crosswalk, sysla_field="sysla", name_field="n
     return rows_out
 
 
-def save_review_csv(rows, path):
+def _num_or_none(v):
+    return v if v not in ("", None) else None
+
+
+def save_candidates(volume: int, rows: list[dict]) -> int:
+    """Replaces every place_duplicate_candidates row for this volume's
+    places (04a's re-run behavior -- no confirmed-same signal exists for
+    places, so nothing needs preserving across a re-run, unlike persons)."""
     if not rows:
         print("No rows to write")
-        return
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"Wrote {len(rows)} candidate rows to {path}")
+        return 0
+    db_rows = []
+    for r in rows:
+        if not r.get("candidate_id"):
+            continue  # skip "NO MATCH FOUND" placeholder rows -- nothing to record
+        db_rows.append({
+            "place_pk": r["place_id"],
+            "di_name": r["di_name"], "di_sysla_given": r["di_sysla_given"],
+            "di_place_type": r["di_place_type"], "di_region": r["di_region"],
+            "wikidata_status": r["wikidata_status"],
+            "candidate_rank": _num_or_none(r["candidate_rank"]),
+            "name_score": _num_or_none(r["name_score"]),
+            "distance_km": _num_or_none(r["distance_km"]),
+            "flag": r["flag"], "match_sources": r["match_sources"],
+            "candidate_name": r["candidate_name"], "candidate_nafnid": r["candidate_id"],
+            "candidate_hreppur": r["candidate_hreppur"], "candidate_sysla": r["candidate_sysla"],
+            "candidate_lat": _num_or_none(r["candidate_lat"]),
+            "candidate_lng": _num_or_none(r["candidate_lng"]),
+        })
+    db.replace_place_duplicate_candidates(volume, db_rows)
+    print(f"Wrote {len(db_rows)} candidate row(s) for vol{volume:02d} to place_duplicate_candidates")
+    return len(db_rows)
 
 
 # ── Run ──────────────────────────────────────────────────────────────────
@@ -366,28 +389,21 @@ def main():
     ap.add_argument("--baeir-csv", default=None, help="override the nafnid baeir.csv path")
     args = ap.parse_args()
 
-    vol = f"{int(args.vol):02d}"
-    geocoded = REVIEW_DIR / f"vol{vol}_places_new_geocoded.csv"
-    ungeocoded = REVIEW_DIR / f"vol{vol}_places_new.csv"
-    review_csv = geocoded if geocoded.exists() else ungeocoded
-    if not review_csv.exists():
-        sys.exit(f"No review CSV found for vol{vol} (looked for {geocoded} and {ungeocoded})")
-
+    volume = int(args.vol)
     baeir_csv = Path(args.baeir_csv) if args.baeir_csv else NAFNID_DATA_DIR / "baeir.csv"
 
     places = load_baeir(baeir_csv)
     crosswalk = load_sysla_crosswalk(NAFNID_LOOKUP_DIR / "sysla_abbrevs.csv")
-    di_mentions = load_di_mentions(review_csv, ungeocoded_only=args.ungeocoded_only)
+    di_mentions = load_di_mentions(volume, ungeocoded_only=args.ungeocoded_only)
     n_geocoded = sum(1 for m in di_mentions if m["_wikidata_status"] == "geocoded")
-    print(f"{len(di_mentions)} place(s) from {review_csv.name} to reconcile against "
+    print(f"{len(di_mentions)} place(s) from vol{volume:02d} to reconcile against "
           f"{len(places)} nafnid records ({n_geocoded} already Wikidata-geocoded, "
           f"still checked against nafnid unless --ungeocoded-only)")
 
     rows = reconcile(di_mentions, places, crosswalk, top_n=args.top_n,
                       max_km=args.max_km, confirm_km=args.confirm_km, conflict_km=args.conflict_km,
                       confirm_name_floor=args.confirm_name_floor)
-    out_path = REVIEW_DIR / f"vol{vol}_places_nafnid_candidates.csv"
-    save_review_csv(rows, out_path)
+    save_candidates(volume, rows)
 
     n_confirmed = sum(1 for r in rows if r["flag"] == "geo_confirmed")
     n_conflict = sum(1 for r in rows if r["flag"] == "geo_conflict")

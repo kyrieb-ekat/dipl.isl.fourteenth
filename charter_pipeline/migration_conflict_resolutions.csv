@@ -1,0 +1,4 @@
+place_id,canonical_name,notes_extra
+l053,Mikligarður,"xlsx canonical_name field held descriptive text, not a name variant: 'is the farm that was purchased' -- folded into notes, CSV's plain name kept as canonical"
+l077,Vatnsfjörður,"xlsx variant 'Vatnsfjörður (Vatknsfjörðarkirkja)' folded into variant_names as a possible church-name form; CSV's plain name kept as canonical"
+l101,Þingvellir,"xlsx spelling 'Þingvelliir' looks like an OCR/typo duplication of the final 'i'; folded into variant_names for fuzzy-match coverage, CSV's correct spelling kept as canonical"

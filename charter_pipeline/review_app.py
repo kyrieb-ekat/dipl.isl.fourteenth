@@ -1,6 +1,10 @@
 """
 DI Charter Authority Review
 Run: streamlit run charter_pipeline/review_app.py
+
+Backed by charter_pipeline.db (SQLite) via db.py -- see schema.sql and
+migrate_to_sqlite.py for how the old per-volume CSVs + the two independently
+-mutable authority stores were unified into one canonical database.
 """
 import subprocess
 import sys
@@ -13,6 +17,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).parent))
 import config
+import db
 
 PYTHON = sys.executable
 SCRIPTS = Path(__file__).parent
@@ -20,63 +25,155 @@ SCRIPTS = Path(__file__).parent
 st.set_page_config(page_title="DI Authority Review", layout="wide")
 
 
-# ── data helpers ───────────────────────────────────────────────────────────────
+# ── generic data/UI helpers ─────────────────────────────────────────────────
+#
+# No hand-rolled full-dataframe cache: every tab fetches fresh from db.py on
+# every render (cheap, indexed SQL reads -- the old CSV-parsing cost that
+# justified a persistent cache doesn't apply here). What IS still needed:
+# (a) a per-session "last known saved state" snapshot so unsaved in-widget
+# edits are never silently discarded/overwritten by a rerun, and (b) a
+# widget-key version counter so st.data_editor remounts cleanly after a
+# mutation changes the underlying rows out from under it. Both are
+# namespaced by the same mergever epoch, so bumping one always invalidates
+# the other in lockstep -- eliminates the old app's one confirmed
+# cache-invalidation bug (a missed pop() in one call site).
 
 
-def load_csv(path: Path, add_cols: dict | None = None) -> pd.DataFrame:
-    """Read CSV as strings; insert any missing columns with their default values."""
-    if not path.exists():
-        return pd.DataFrame()
-    df = pd.read_csv(path, dtype=str, on_bad_lines="warn").fillna("")
-    if add_cols:
-        for col, default in add_cols.items():
-            if col not in df.columns:
-                df.insert(len(df.columns), col, default)
-    return df
+def bump(*keys: str) -> None:
+    for k in keys:
+        st.session_state[f"_mergever_{k}"] = st.session_state.get(f"_mergever_{k}", 0) + 1
 
 
-def autosave(session_key: str, edited: pd.DataFrame, path: Path) -> None:
-    """Write to disk whenever the edited df differs from the session-state snapshot."""
-    prev = st.session_state.get(f"_snap_{session_key}")
-    if prev is None or not edited.equals(prev):
-        edited.to_csv(path, index=False)
-        st.session_state[f"_snap_{session_key}"] = edited.copy()
-        st.toast("Saved")
+def mergever(key: str) -> int:
+    return st.session_state.get(f"_mergever_{key}", 0)
+
+
+def snap_key(session_key: str) -> str:
+    return f"_snap_{session_key}_{mergever(session_key)}"
+
+
+def ensure_snapshot(session_key: str, df: pd.DataFrame) -> None:
+    k = snap_key(session_key)
+    if k not in st.session_state:
+        st.session_state[k] = df.copy()
+
+
+def is_dirty(session_key: str, edited: pd.DataFrame) -> bool:
+    snap = st.session_state.get(snap_key(session_key))
+    return snap is None or not edited.reset_index(drop=True).equals(snap.reset_index(drop=True))
+
+
+def mark_saved(session_key: str, edited: pd.DataFrame) -> None:
+    st.session_state[snap_key(session_key)] = edited.copy()
+
+
+def apply_row_diffs(before_df: pd.DataFrame, after_df: pd.DataFrame, id_col: str,
+                     update_fn, editable_cols: list[str]) -> int:
+    """For every row where any editable_cols value differs between before_df
+    and after_df (matched by id_col), calls update_fn(id_value, **changes).
+    Returns the number of rows updated."""
+    if before_df.empty:
+        return 0
+    before_by_id = before_df.set_index(id_col)
+    n = 0
+    for _, row in after_df.iterrows():
+        rid = row[id_col]
+        if rid not in before_by_id.index:
+            continue
+        brow = before_by_id.loc[rid]
+        changes = {c: row[c] for c in editable_cols
+                   if c in brow.index and str(row[c]) != str(brow[c])}
+        if changes:
+            update_fn(rid, **changes)
+            n += 1
+    return n
+
+
+def save_button(session_key: str, edited: pd.DataFrame, apply_fn, label: str = "Save changes") -> None:
+    """apply_fn(edited_df) -> int (rows changed): persists pending edits.
+    Disabled while there's nothing to save."""
+    dirty = is_dirty(session_key, edited)
+    col_btn, col_status = st.columns([1, 5])
+    with col_btn:
+        if st.button(label, key=f"save_{session_key}", disabled=not dirty,
+                     type="primary" if dirty else "secondary"):
+            n = apply_fn(edited)
+            mark_saved(session_key, edited)
+            bump(session_key)
+            st.toast(f"Saved ({n} row(s) changed).")
+            st.rerun()
+    with col_status:
+        if dirty:
+            st.warning("Unsaved changes — click **Save changes** to write them.")
+        else:
+            st.caption("All changes saved.")
 
 
 def with_wikidata_links(df: pd.DataFrame, id_col: str = "wikidata_id") -> pd.DataFrame:
     out = df.copy()
-    out["wikidata_link"] = out[id_col].apply(
-        lambda q: f"https://www.wikidata.org/wiki/{q}" if q.strip() else ""
+    out["wikidata_link"] = out[id_col].fillna("").apply(
+        lambda q: f"https://www.wikidata.org/wiki/{q}" if str(q).strip() else ""
     )
     return out
 
 
-def available_volumes() -> list[str]:
-    if not config.REVIEW_DIR.exists():
-        return []
-    return sorted(
-        p.stem.replace("_review_queue", "")
-        for p in config.REVIEW_DIR.glob("*_review_queue.csv")
-    )
+def with_checkbox(df: pd.DataFrame, col_name: str = "select") -> pd.DataFrame:
+    out = df.copy()
+    out.insert(0, col_name, False)
+    return out
 
 
-# ── pipeline helpers ───────────────────────────────────────────────────────────
+def blank_if_null(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """DataFrame-sourced nullable numeric columns come back as float64 NaN --
+    render them as '' in editable text columns rather than the literal
+    string 'nan' (same pitfall fixed in person_authority.py/place_authority.py)."""
+    out = df.copy()
+    for c in cols:
+        if c in out.columns:
+            out[c] = out[c].apply(lambda v: "" if pd.isna(v) else
+                                   (str(int(v)) if float(v).is_integer() else str(v)))
+    return out
+
+
+# ── undo control (rendered on every tab, per plan section 2.5) ─────────────
+
+
+def undo_widget(location_key: str) -> None:
+    last = db.get_last_action()
+    if not last:
+        return
+    confirm_key = f"_undo_confirm_{location_key}"
+    col1, col2 = st.columns([1, 5])
+    with col1:
+        if not st.session_state.get(confirm_key):
+            if st.button("↩ Undo", key=f"undo_btn_{location_key}"):
+                st.session_state[confirm_key] = True
+                st.rerun()
+        else:
+            if st.button("Confirm undo", key=f"undo_confirm_{location_key}", type="primary"):
+                result = db.undo_last_action()
+                st.session_state[confirm_key] = False
+                st.toast(f"Undone: {result['description']}")
+                st.rerun()
+    with col2:
+        if st.session_state.get(confirm_key):
+            st.warning(f"Undo **{last['description']}**? (This is itself only reversible by another undo.)")
+        else:
+            st.caption(f"Last action: _{last['description']}_")
+
+
+# ── pipeline subprocess helpers (unchanged from before the migration) ──────
 
 
 def run_command(cmd: list[str], session_key: str) -> None:
-    """Launch cmd in a background thread; stream stdout/stderr into session_state."""
     rec: dict = {"status": "running", "output": [], "code": None}
     st.session_state[session_key] = rec
 
     def _worker() -> None:
         try:
             proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                cwd=str(SCRIPTS),
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, cwd=str(SCRIPTS),
             )
             for line in iter(proc.stdout.readline, ""):
                 rec["output"].append(line.rstrip())
@@ -92,7 +189,6 @@ def run_command(cmd: list[str], session_key: str) -> None:
 
 
 def step_output(session_key: str) -> bool:
-    """Render step output. Returns True if the step is still running."""
     rec = st.session_state.get(session_key)
     if not rec:
         return False
@@ -108,7 +204,6 @@ def step_output(session_key: str) -> bool:
 
 
 def step_label(base: str, *keys: str) -> str:
-    """Append a status suffix to an expander label based on session state."""
     statuses = [st.session_state.get(k, {}).get("status", "") for k in keys]
     if "running" in statuses:
         return base + "  (running...)"
@@ -121,114 +216,404 @@ def is_running(*keys: str) -> bool:
     return any(st.session_state.get(k, {}).get("status") == "running" for k in keys)
 
 
-def vol_num(v: str) -> int:
-    """'vol04' -> 4"""
-    return int(v[3:])
+def run_sync(cmd: list[str]) -> tuple[int, str]:
+    """Run a step and block until it finishes -- used by the chained runner,
+    where auto-advancing to the next step only makes sense after this one
+    has actually completed (unlike the per-step buttons, which poll async
+    so the user can keep an eye on the Pipeline tab while it streams)."""
+    proc = subprocess.run(cmd, cwd=str(SCRIPTS), capture_output=True, text=True)
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
-# ── sidebar ────────────────────────────────────────────────────────────────────
+# ── compare panel (plan section 2.3) ────────────────────────────────────────
+
+_COMPARE_ROWS = {
+    "person": [
+        ("Name", "canonical_name", "canonical_name"),
+        ("Variants", "variant_names", "variant_names"),
+        ("Occupation", "occupation", "occupation"),
+        ("Title", "title", "title"),
+        ("Floruit", ("floruit_start", "floruit_end"), ("floruit_start", "floruit_end")),
+        ("Notes", "notes", "notes"),
+        ("Sources", "sources", "sources"),
+    ],
+    "place": [
+        ("Name", "canonical_name", "canonical_name"),
+        ("Variants", "variant_names", "variant_names"),
+        ("Type", "place_type", "place_type"),
+        ("Region", "region", "region"),
+        ("Coordinates", ("coordinates_lat", "coordinates_long"), ("coordinates_lat", "coordinates_long")),
+        ("Notes", "notes", "notes"),
+        ("Sources", "sources", "sources"),
+    ],
+}
+
+
+def render_compare_panel(entity_type: str, candidate_pk: int, authority_options: list[dict],
+                          key_suffix: str = "") -> None:
+    """Inline (NOT a modal) comparison of a candidate person/place against its
+    likely authority match(es). Rendered directly in the normal page flow --
+    right where a reviewer is already looking at the row -- so it reads as
+    part of reviewing entries rather than a separate action you have to
+    summon and then dismiss. key_suffix keeps widget keys unique when this
+    renders inside a per-row loop (e.g. Final Review)."""
+    candidate = (db.get_person_by_pk(candidate_pk) if entity_type == "person"
+                 else db.get_place_by_pk(candidate_pk))
+    if candidate is None:
+        st.error("This row no longer exists (it may have just been merged or promoted).")
+        return
+
+    if not authority_options:
+        st.info("No plausible authority match found for this name.")
+        return
+
+    # person_pk and place_pk are separate autoincrement sequences, so the same
+    # integer can legitimately identify one person AND one place -- entity_type
+    # must be part of every widget key here, not just candidate_pk, or a
+    # coincidental collision between the two tables raises
+    # StreamlitDuplicateElementKey the moment both happen to render in the
+    # same script run (e.g. one in New Entities, one in Final Review).
+    key_base = f"{entity_type}_{candidate_pk}{key_suffix}"
+
+    labels = [f"{o['display_id']} — {o['canonical_name']}"
+              + (f"  (score {o['_match_score']:.0f})" if "_match_score" in o else "")
+              for o in authority_options]
+    idx = st.selectbox("Authority match", range(len(labels)), format_func=lambda i: labels[i],
+                        key=f"cmp_match_{key_base}")
+    match = authority_options[idx]
+
+    st.markdown(f"**Candidate** (`{candidate['display_id']}`, {candidate['status']}) "
+                f"vs. **Authority** (`{match['display_id']}`)")
+
+    rows = _COMPARE_ROWS[entity_type]
+    left_col, mid_col, right_col = st.columns([3, 1, 3])
+    with left_col:
+        st.caption("Candidate")
+    with right_col:
+        st.caption("Authority match")
+
+    def _blank(v) -> str:
+        # match's values come from a pandas DataFrame (db.search_authority) --
+        # NaN is truthy in Python, so `v or ""` doesn't catch it and str(nan)
+        # renders the literal text "nan". candidate's values come straight
+        # from sqlite3.Row (proper None), where this is a no-op.
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        return str(v)
+
+    for label, cand_keys, match_keys in rows:
+        if isinstance(cand_keys, tuple):
+            cand_val = " – ".join(_blank(candidate.get(k)) for k in cand_keys)
+            match_val = " – ".join(_blank(match.get(k)) for k in match_keys)
+        else:
+            cand_val = _blank(candidate.get(cand_keys))
+            match_val = _blank(match.get(match_keys))
+        c1, c2, c3 = st.columns([3, 1, 3])
+        with c1:
+            st.text(cand_val or "—")
+        with c2:
+            st.markdown("✓" if cand_val.strip().lower() == match_val.strip().lower() and cand_val.strip() else "≠")
+        with c3:
+            st.text(match_val or "—")
+
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("Same — merge into authority", type="primary", key=f"cmp_same_{key_base}"):
+            db.merge_into_authority(entity_type, candidate_pk,
+                                     match["person_pk" if entity_type == "person" else "place_pk"])
+            st.toast("Merged into authority.")
+            st.rerun()
+    with b2:
+        if st.button("Genuinely new — confirm", key=f"cmp_new_{key_base}"):
+            if entity_type == "person":
+                db.update_person(candidate_pk, review_status="add")
+            else:
+                db.update_place(candidate_pk, review_status="add")
+            st.toast("Marked review_status=add.")
+            st.rerun()
+
+
+def render_compare_from_lookup(entity_type: str, candidate_pk: int, key_suffix: str = "") -> None:
+    candidate = (db.get_person_by_pk(candidate_pk) if entity_type == "person"
+                 else db.get_place_by_pk(candidate_pk))
+    if candidate is None:
+        return
+    options = db.search_authority(entity_type, candidate["canonical_name"], limit=3)
+    render_compare_panel(entity_type, candidate_pk, options, key_suffix)
+
+
+def render_compare_from_known(entity_type: str, candidate_pk: int, other_pk: int, key_suffix: str = "") -> None:
+    other = db.get_person_by_pk(other_pk) if entity_type == "person" else db.get_place_by_pk(other_pk)
+    render_compare_panel(entity_type, candidate_pk, [other] if other else [], key_suffix)
+
+
+# ── sidebar ──────────────────────────────────────────────────────────────────
 
 st.title("DI Authority Review")
 
-vols = available_volumes()
-if vols:
-    vol = st.sidebar.selectbox("Volume", vols, index=len(vols) - 1)
+volumes = db.get_volumes()
+if volumes:
+    vol_options = [f"vol{v:02d}" for v in volumes]
+    vol = st.sidebar.selectbox("Volume", vol_options, index=len(vol_options) - 1)
+    vn = int(vol[3:])
 else:
-    # No review CSVs yet — let user enter a volume number for the pipeline
-    _vn = st.sidebar.number_input("Volume number", min_value=1, value=4, step=1)
-    vol = f"vol{int(_vn):02d}"
-    st.sidebar.caption("No review CSVs found yet. Run pipeline steps 3-5 to create them.")
+    _vn_input = st.sidebar.number_input("Volume number", min_value=1, value=1, step=1)
+    vn = int(_vn_input)
+    vol = f"vol{vn:02d}"
+    st.sidebar.caption("No volumes in the database yet. Run Step 1 in the Pipeline tab to create one.")
 
 st.sidebar.markdown("---")
-try:
-    rel = config.REVIEW_DIR.relative_to(Path.cwd())
-except ValueError:
-    rel = config.REVIEW_DIR
-st.sidebar.caption(f"Review dir: `{rel}`")
+st.sidebar.caption(f"Database: `{Path(config.DB_PATH).name}`")
+st.sidebar.caption(
+    "Person Duplicates, Place Duplicates, and Final Review are cross-volume — "
+    "the Volume selector above does not filter those tabs."
+)
 
-vn = vol_num(vol)
-queue_path    = config.REVIEW_DIR / f"{vol}_review_queue.csv"
-persons_path  = config.REVIEW_DIR / f"{vol}_persons_new.csv"
-places_path   = config.REVIEW_DIR / f"{vol}_places_new.csv"
-geocoded_path = config.REVIEW_DIR / f"{vol}_places_new_geocoded.csv"
-auth_pl_path  = SCRIPTS / "place_names_authority.csv"
-auth_pe_path  = SCRIPTS / "person_names_authority.csv"
-
-tab_pipeline, tab_queue, tab_entities, tab_dupes, tab_authority = st.tabs(
-    ["Pipeline", "Review Queue", "New Entities", "Person Duplicates", "Authority Browser"]
+tab_pipeline, tab_charters, tab_queue, tab_entities, tab_dupes, tab_place_dupes, tab_final, tab_authority = st.tabs(
+    ["Pipeline", "Charters", "Review Queue", "New Entities",
+     "Person Duplicates", "Place Duplicates", "Final Review", "Authority Browser"]
 )
 
 
-# ── tab 0: pipeline ───────────────────────────────────────────────────────────
+# ── tab: pipeline ────────────────────────────────────────────────────────────
 
-with tab_pipeline:
+@st.fragment
+def render_pipeline_tab():
+    # The whole tab body lives inside one fragment so its background-step
+    # polling (`if any_running: time.sleep(0.5); st.rerun()` at the bottom)
+    # only reruns THIS fragment, not the entire script. Before this, that
+    # rerun was a full-page rerun -- and since Streamlit renders every
+    # st.tabs() body on every script run regardless of which tab is visually
+    # active, a pipeline step (or a stuck "running" status left over from
+    # one) would blow away in-progress state on completely different tabs
+    # every 0.5s, e.g. resetting a just-checked row in New Entities and
+    # collapsing its Compare panel a moment after it appeared.
+    undo_widget("pipeline")
     st.caption(
-        "Run each step in order for the selected volume. "
-        "Steps that require manual review prompt you to switch to the other tabs."
+        "Run the whole volume in one go with **Run volume**, or use the individual "
+        "steps below for manual control / recovery."
     )
 
+    chain_key = f"chain_{vol}"
+    chain = st.session_state.setdefault(chain_key, {"active": False, "idx": 0, "pdf_path": ""})
+
+    CHAIN_STEPS = [
+        {"id": "extract_text", "label": "Extract text"},
+        {"id": "extract_entities", "label": "Extract entities (Claude API)"},
+        {"id": "resolve_entities", "label": "Resolve entities"},
+        {"id": "export_to_db", "label": "Export to database"},
+        {"id": "pause_triage", "label": "Triage new data"},
+        {"id": "geocode", "label": "Geocode places"},
+        {"id": "nafnid", "label": "Nafnid reconciliation"},
+        {"id": "pause_places", "label": "Set place Status"},
+        {"id": "pause_flags", "label": "Final flagged-charter check"},
+        {"id": "export_authority", "label": "Export authority XLSX"},
+    ]
+
+    with st.container(border=True):
+        st.markdown("**Run volume**")
+        if not chain["active"]:
+            chain["pdf_path"] = st.text_input(
+                "PDF path (only needed if Step 1 hasn't been run for this volume yet)",
+                value=chain.get("pdf_path", ""),
+                placeholder=str(config.PDF_DIR / f"Diplomatarium_Islandicum___Bindi_{vn}.pdf"),
+                key="chain_pdf_input",
+            )
+            if st.button("▶ Run volume", key="chain_start", type="primary"):
+                chain["active"] = True
+                chain["idx"] = 0
+                st.rerun()
+        else:
+            idx = chain["idx"]
+            for i, step in enumerate(CHAIN_STEPS):
+                icon = "✓" if i < idx else ("▶" if i == idx else "⏳")
+                st.markdown(f"{icon} {step['label']}")
+                if i == idx:
+                    break
+
+            if idx >= len(CHAIN_STEPS):
+                st.success("Chain complete for this volume.")
+                if st.button("Reset", key="chain_reset"):
+                    chain["active"] = False
+                    chain["idx"] = 0
+                    st.rerun()
+            else:
+                cur = CHAIN_STEPS[idx]
+
+                if cur["id"] == "extract_text":
+                    pdf = chain.get("pdf_path", "").strip()
+                    if not pdf:
+                        st.warning("No PDF path given — skipping text extraction "
+                                   "(assuming segments already exist for this volume).")
+                        chain["idx"] += 1
+                        st.rerun()
+                    else:
+                        code, out = run_sync([PYTHON, "01_extract_text.py", "--pdf", pdf, "--vol", str(vn)])
+                        st.code(out[-3000:], language=None)
+                        if code == 0:
+                            chain["idx"] += 1
+                            st.rerun()
+                        else:
+                            st.error(f"Step 1 failed (exit {code}). Fix the PDF path and click Run volume again.")
+                            chain["active"] = False
+
+                elif cur["id"] == "extract_entities":
+                    st.warning(
+                        "This calls the Claude API once per charter and may take several "
+                        "minutes and consume API credits."
+                    )
+                    if st.button("Start extraction", key="chain_confirm_s2", type="primary"):
+                        code, out = run_sync([PYTHON, "02_extract_entities.py", "--vol", str(vn)])
+                        st.code(out[-3000:], language=None)
+                        if code == 0:
+                            chain["idx"] += 1
+                            st.rerun()
+                        else:
+                            st.error(f"Step 2 failed (exit {code}).")
+                            chain["active"] = False
+                    if st.button("Cancel chain", key="chain_cancel_s2"):
+                        chain["active"] = False
+                        st.rerun()
+
+                elif cur["id"] == "resolve_entities":
+                    code, out = run_sync([PYTHON, "03_resolve_entities.py", "--vol", str(vn)])
+                    st.code(out[-3000:], language=None)
+                    if code == 0:
+                        chain["idx"] += 1
+                        st.rerun()
+                    else:
+                        st.error(f"Step 3 failed (exit {code}).")
+                        chain["active"] = False
+
+                elif cur["id"] == "export_to_db":
+                    code, out = run_sync([PYTHON, "05_export_csvs.py", "--vol", str(vn), "--force"])
+                    st.code(out[-3000:], language=None)
+                    if code == 0:
+                        chain["idx"] += 1
+                        st.rerun()
+                    else:
+                        st.error(f"Step 5 failed (exit {code}).")
+                        chain["active"] = False
+
+                elif cur["id"] == "pause_triage":
+                    n_open = len(db.get_open_review_items(vn))
+                    n_new_p = len(db.get_persons(status="provisional", source_volume=vn))
+                    n_new_pl = len(db.get_places(status="provisional", source_volume=vn))
+                    n_flagged = len(db.get_charters(volume=vn, has_review=True))
+                    st.info(
+                        f"**{n_open}** open Review Queue item(s) · **{n_new_p}** new person(s) · "
+                        f"**{n_new_pl}** new place(s) · **{n_flagged}** flagged charter(s). "
+                        "Nothing downstream requires these at zero — this is a checkpoint, not a hard gate."
+                    )
+                    if st.button("Continue pipeline", key="chain_continue_triage", type="primary"):
+                        chain["idx"] += 1
+                        st.rerun()
+
+                elif cur["id"] == "geocode":
+                    code, out = run_sync([PYTHON, "04_lookup_coords.py", "--vol", str(vn)])
+                    st.code(out[-3000:], language=None)
+                    if code == 0:
+                        chain["idx"] += 1
+                        st.rerun()
+                    else:
+                        st.error(f"Step 4 failed (exit {code}). This usually means a network/SPARQL "
+                                 "endpoint problem -- check the output above and retry.")
+                        chain["active"] = False
+
+                elif cur["id"] == "nafnid":
+                    code, out = run_sync([PYTHON, "04a_reconcile_nafnid.py", "--vol", str(vn)])
+                    st.code(out[-3000:], language=None)
+                    if code == 0:
+                        chain["idx"] += 1
+                        st.rerun()
+                    else:
+                        st.error(f"Step 4a failed (exit {code}).")
+                        chain["active"] = False
+
+                elif cur["id"] == "pause_places":
+                    places_df = db.get_places(status="provisional", source_volume=vn)
+                    counts = places_df["review_status"].fillna("").value_counts() if not places_df.empty else {}
+                    n_ok = counts.get("ok", 0); n_skip = counts.get("skip", 0)
+                    n_add = counts.get("add", 0); n_blank = counts.get("", 0)
+                    st.info(
+                        f"Places Status breakdown: **ok**={n_ok} · **skip**={n_skip} · "
+                        f"**add**={n_add} · **blank**={n_blank}. "
+                        "Blank rows are exported like **ok** by default — mark **skip** in "
+                        "New Entities > Places to exclude a row, **add** to also promote it."
+                    )
+                    if st.button("Continue pipeline", key="chain_continue_places", type="primary"):
+                        chain["idx"] += 1
+                        st.rerun()
+
+                elif cur["id"] == "pause_flags":
+                    db.rescan_review_flags(vn)
+                    n_flagged = len(db.get_charters(volume=vn, has_review=True))
+                    if n_flagged:
+                        st.warning(
+                            f"**{n_flagged}** charter(s) still flagged (parse error / unresolved "
+                            "persons or places). See the **Charters** tab (filtered to flagged) "
+                            "and the **Review Queue** tab."
+                        )
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            if st.button("Re-check now", key="chain_recheck_flags"):
+                                st.rerun()
+                        with c2:
+                            if st.button(f"Continue anyway ({n_flagged} will be skipped by export)",
+                                          key="chain_continue_anyway"):
+                                chain["idx"] += 1
+                                st.rerun()
+                    else:
+                        st.success("No flagged charters remain.")
+                        chain["idx"] += 1
+                        st.rerun()
+
+                elif cur["id"] == "export_authority":
+                    code, out = run_sync([PYTHON, "06_export_authority.py", "--vol", str(vn), "--dry-run"])
+                    st.code(out, language=None)
+                    if st.button("Apply export", key="chain_apply_export", type="primary"):
+                        code2, out2 = run_sync([PYTHON, "06_export_authority.py", "--vol", str(vn)])
+                        st.code(out2, language=None)
+                        if code2 == 0:
+                            chain["idx"] += 1
+                            st.rerun()
+                    if st.button("Cancel chain", key="chain_cancel_export"):
+                        chain["active"] = False
+                        st.rerun()
+
+    st.markdown("---")
+    st.caption("Individual steps (manual control / recovery):")
     any_running = False
 
-    # ── One-time setup ───────────────────────────────────────────────────────
-    with st.expander(
-        step_label("One-time setup — seed authority CSVs from XLSX", "setup_pl", "setup_pe")
-    ):
-        st.caption(
-            "Run once per machine, or after the master XLSX has changed significantly. "
-            "Safe to re-run with `--overwrite`."
-        )
+    with st.expander(step_label("One-time setup — seed authority CSVs from XLSX", "setup_pl", "setup_pe")):
         col_pl, col_pe = st.columns(2)
-
         with col_pl:
             overwrite_pl = st.checkbox("--overwrite", key="setup_pl_ow")
             cmd_pl = [PYTHON, "seed_place_names.py"] + (["--overwrite"] if overwrite_pl else [])
             if st.button("Seed place authority", key="btn_setup_pl", disabled=is_running("setup_pl")):
-                run_command(cmd_pl, "setup_pl")
-                st.rerun()
+                run_command(cmd_pl, "setup_pl"); st.rerun()
             if step_output("setup_pl"):
                 any_running = True
-
         with col_pe:
             overwrite_pe = st.checkbox("--overwrite", key="setup_pe_ow")
             cmd_pe = [PYTHON, "seed_person_names.py"] + (["--overwrite"] if overwrite_pe else [])
             if st.button("Seed person authority", key="btn_setup_pe", disabled=is_running("setup_pe")):
-                run_command(cmd_pe, "setup_pe")
-                st.rerun()
+                run_command(cmd_pe, "setup_pe"); st.rerun()
             if step_output("setup_pe"):
                 any_running = True
 
-    # ── Step 1 ───────────────────────────────────────────────────────────────
     s1_key = f"s1_{vol}"
     with st.expander(step_label("Step 1 — Extract charter text from PDF", s1_key)):
-        st.caption(
-            "Splits the PDF into one .txt file per charter. "
-            "Re-running overwrites existing segments."
-        )
-        pdf_input = st.text_input(
-            "PDF path",
-            key="s1_pdf",
-            placeholder=str(config.PDF_DIR / f"Diplomatarium_Islandicum___Bindi_{vn}.pdf"),
-        )
-        if st.button(
-            "Run",
-            key="btn_s1",
-            disabled=is_running(s1_key) or not pdf_input.strip(),
-        ):
-            run_command(
-                [PYTHON, "01_extract_text.py", "--pdf", pdf_input.strip(), "--vol", str(vn)],
-                s1_key,
-            )
+        pdf_input = st.text_input("PDF path", key="s1_pdf",
+                                    placeholder=str(config.PDF_DIR / f"Diplomatarium_Islandicum___Bindi_{vn}.pdf"))
+        if st.button("Run", key="btn_s1", disabled=is_running(s1_key) or not pdf_input.strip()):
+            run_command([PYTHON, "01_extract_text.py", "--pdf", pdf_input.strip(), "--vol", str(vn)], s1_key)
             st.rerun()
         if step_output(s1_key):
             any_running = True
 
-    # ── Step 2 ───────────────────────────────────────────────────────────────
     s2_key = f"s2_{vol}"
     with st.expander(step_label("Step 2 — Extract entities with Claude API", s2_key)):
-        st.caption(
-            "Sends each charter to the Claude API. Large volumes take several minutes. "
-            "Results append incrementally so you can pause and resume with batch ranges."
-        )
         use_batch = st.checkbox("Use batch range", key="s2_batch")
         cmd2 = [PYTHON, "02_extract_entities.py", "--vol", str(vn)]
         if use_batch:
@@ -239,509 +624,514 @@ with tab_pipeline:
                 s2_end = st.number_input("End charter", min_value=1, value=50, key="s2_end")
             cmd2 += ["--start", str(int(s2_start)), "--end", str(int(s2_end))]
         if st.button("Run", key="btn_s2", disabled=is_running(s2_key)):
-            run_command(cmd2, s2_key)
-            st.rerun()
+            run_command(cmd2, s2_key); st.rerun()
         if step_output(s2_key):
             any_running = True
 
-    # ── Step 3 ───────────────────────────────────────────────────────────────
     s3_key = f"s3_{vol}"
-    with st.expander(step_label("Step 3 — Resolve entities against authority files", s3_key)):
+    with st.expander(step_label("Step 3 — Resolve entities against canonical persons/places", s3_key)):
         col_fa, col_fr = st.columns(2)
         with col_fa:
-            s3_accept = st.slider(
-                "Auto-assign threshold",
-                min_value=1, max_value=100, value=85,
-                key="s3_accept",
-                help="Scores at or above this are automatically assigned an existing authority ID.",
-            )
+            s3_accept = st.slider("Auto-assign threshold", 1, 100, 85, key="s3_accept")
         with col_fr:
-            s3_review = st.slider(
-                "Review threshold",
-                min_value=1, max_value=100, value=60,
-                key="s3_review",
-                help="Scores between this and the auto-assign threshold go to the review queue. Below this becomes a new entity.",
-            )
+            s3_review = st.slider("Review threshold", 1, 100, 60, key="s3_review")
         if s3_review >= s3_accept:
             st.warning("Review threshold must be lower than the auto-assign threshold.")
         cmd3 = [PYTHON, "03_resolve_entities.py", "--vol", str(vn),
                 "--fuzzy-accept", str(s3_accept), "--fuzzy-review", str(s3_review)]
         if st.button("Run", key="btn_s3", disabled=is_running(s3_key) or s3_review >= s3_accept):
-            run_command(cmd3, s3_key)
-            st.rerun()
+            run_command(cmd3, s3_key); st.rerun()
         if step_output(s3_key):
             any_running = True
 
-    # ── Step 4 ───────────────────────────────────────────────────────────────
+    s5_key = f"s5_{vol}"
+    with st.expander(step_label("Step 5 — Export into the database", s5_key)):
+        st.caption("Loads charters/charter_persons/charter_places into the DB. Not idempotent "
+                   "by design -- pass --force to replace an already-loaded volume.")
+        force5 = st.checkbox("--force (replace existing)", key="s5_force")
+        cmd5 = [PYTHON, "05_export_csvs.py", "--vol", str(vn)] + (["--force"] if force5 else [])
+        if st.button("Run", key="btn_s5", disabled=is_running(s5_key)):
+            run_command(cmd5, s5_key); st.rerun()
+        if step_output(s5_key):
+            any_running = True
+
     s4_key = f"s4_{vol}"
     with st.expander(step_label("Step 4 — Geocode new places via Wikidata", s4_key)):
-        st.caption("Queries Wikidata SPARQL for coordinates of new places.")
         if st.button("Run", key="btn_s4", disabled=is_running(s4_key)):
-            run_command([PYTHON, "04_lookup_coords.py", "--vol", str(vn)], s4_key)
-            st.rerun()
+            run_command([PYTHON, "04_lookup_coords.py", "--vol", str(vn)], s4_key); st.rerun()
         if step_output(s4_key):
             any_running = True
 
-    # ── Step 4b ───────────────────────────────────────────────────────────────
-    s4b_ann_key = f"s4b_ann_{vol}"
-    s4b_app_key = f"s4b_app_{vol}"
-    with st.expander(
-        step_label("Step 4b — Reconcile place names", s4b_ann_key, s4b_app_key)
-    ):
-        geocoded_csv = str(geocoded_path)
-        col_ann, col_app = st.columns(2)
-
-        with col_ann:
-            st.caption("First: annotate the geocoded CSV with proposed authority matches.")
-            if st.button(
-                "Annotate CSV", key="btn_s4b_ann", disabled=is_running(s4b_ann_key)
-            ):
-                run_command(
-                    [PYTHON, "04b_propagate_corrections.py", "--csv", geocoded_csv, "--annotate"],
-                    s4b_ann_key,
-                )
-                st.rerun()
-            if step_output(s4b_ann_key):
-                any_running = True
-
-        with col_app:
-            st.caption(
-                "Then: review in **New Entities > Places**, set `review_status`, and apply."
-            )
-            if st.button(
-                "Apply decisions", key="btn_s4b_app", disabled=is_running(s4b_app_key)
-            ):
-                run_command(
-                    [PYTHON, "04b_propagate_corrections.py", "--csv", geocoded_csv],
-                    s4b_app_key,
-                )
-                st.rerun()
-            if step_output(s4b_app_key):
-                any_running = True
-
-    # ── Step 4c ───────────────────────────────────────────────────────────────
-    s4c_dr_key = f"s4c_dr_{vol}"
-    s4c_key = f"s4c_{vol}"
-    with st.expander(step_label("Step 4c — Add new places to authority", s4c_key)):
-        st.caption(
-            "Promotes rows with `review_status=add` from the geocoded CSV "
-            "into `place_names_authority.csv`."
-        )
-        col_dr, col_ap = st.columns(2)
-        with col_dr:
-            if st.button("Dry run", key="btn_s4c_dr", disabled=is_running(s4c_dr_key)):
-                run_command(
-                    [PYTHON, "04c_add_to_authority.py", "--csv", str(geocoded_path), "--dry-run"],
-                    s4c_dr_key,
-                )
-                st.rerun()
-            if step_output(s4c_dr_key):
-                any_running = True
-        with col_ap:
-            if st.button("Apply", key="btn_s4c", disabled=is_running(s4c_key)):
-                run_command(
-                    [PYTHON, "04c_add_to_authority.py", "--csv", str(geocoded_path)],
-                    s4c_key,
-                )
-                st.rerun()
-            if step_output(s4c_key):
-                any_running = True
-
-    # ── Step 5 ───────────────────────────────────────────────────────────────
-    s5_key = f"s5_{vol}"
-    with st.expander(step_label("Step 5 — Export review CSVs", s5_key)):
-        st.caption(
-            "Writes charters.csv, persons_new.csv, places_new.csv, and review_queue.csv "
-            "to the review directory."
-        )
-        if st.button("Run", key="btn_s5", disabled=is_running(s5_key)):
-            # Clear cached review data so the tabs reload fresh CSVs after this step
-            for k in [f"{vol}_queue", f"{vol}_persons", f"{vol}_places"]:
-                st.session_state.pop(k, None)
-            run_command([PYTHON, "05_export_csvs.py", "--vol", str(vn)], s5_key)
-            st.rerun()
-        if step_output(s5_key):
-            any_running = True
-        if st.session_state.get(s5_key, {}).get("status") == "done":
-            st.info(
-                "Review queue and new entity CSVs are ready. "
-                "Switch to the **Review Queue** and **New Entities** tabs to triage, "
-                "then return here to continue with steps 5b onward."
-            )
-
-    # ── Step 5b ───────────────────────────────────────────────────────────────
-    s5b_key = f"s5b_{vol}"
-    with st.expander(step_label("Step 5b — Rescan charter review flags", s5b_key)):
-        st.caption(
-            "Re-checks charters.csv for unresolved REVIEW: prefixes after manual edits. "
-            "Run this after resolving flags in the charters CSV before proceeding to step 6."
-        )
-        if st.button("Run", key="btn_s5b", disabled=is_running(s5b_key)):
-            run_command([PYTHON, "05b_rescan_flags.py", "--vol", str(vn)], s5b_key)
-            st.rerun()
-        if step_output(s5b_key):
+    s4a_key = f"s4a_{vol}"
+    with st.expander(step_label("Step 4a — Reconcile against nafnid.is", s4a_key)):
+        st.caption("Writes candidates to the **Place Duplicates** tab for manual triage.")
+        if st.button("Run", key="btn_s4a", disabled=is_running(s4a_key)):
+            run_command([PYTHON, "04a_reconcile_nafnid.py", "--vol", str(vn)], s4a_key); st.rerun()
+        if step_output(s4a_key):
             any_running = True
 
-    # ── Step 4d ───────────────────────────────────────────────────────────────
-    s4d_dr_key = f"s4d_dr_{vol}"
-    s4d_key = f"s4d_{vol}"
-    with st.expander(step_label("Step 4d — Add new persons to authority", s4d_key)):
-        st.caption(
-            "Promotes rows with `review_status=add` from persons_new.csv "
-            "into `person_names_authority.csv`."
-        )
-        col_dr, col_ap = st.columns(2)
-        with col_dr:
-            if st.button("Dry run", key="btn_s4d_dr", disabled=is_running(s4d_dr_key)):
-                run_command(
-                    [PYTHON, "04d_add_to_person_authority.py", "--csv", str(persons_path), "--dry-run"],
-                    s4d_dr_key,
-                )
-                st.rerun()
-            if step_output(s4d_dr_key):
-                any_running = True
-        with col_ap:
-            if st.button("Apply", key="btn_s4d", disabled=is_running(s4d_key)):
-                run_command(
-                    [PYTHON, "04d_add_to_person_authority.py", "--csv", str(persons_path)],
-                    s4d_key,
-                )
-                st.rerun()
-            if step_output(s4d_key):
-                any_running = True
-
-    # ── Step 6 ───────────────────────────────────────────────────────────────
-    s6_dr_key = f"s6_dr_{vol}"
     s6_key = f"s6_{vol}"
-    with st.expander(step_label("Step 6 — Merge into authority XLSX", s6_key)):
-        st.caption(
-            "Merges approved charters, persons, and places into a copy of the authority XLSX. "
-            "The original is never modified."
-        )
+    with st.expander(step_label("Step 6 — Export authority XLSX + nodegoat CSV", s6_key)):
         col_dr, col_ap = st.columns(2)
         with col_dr:
-            if st.button("Dry run", key="btn_s6_dr", disabled=is_running(s6_dr_key)):
-                run_command(
-                    [PYTHON, "06_merge_into_xlsx.py", "--vol", str(vn), "--dry-run"],
-                    s6_dr_key,
-                )
+            if st.button("Dry run", key="btn_s6_dr", disabled=is_running(f"{s6_key}_dr")):
+                run_command([PYTHON, "06_export_authority.py", "--vol", str(vn), "--dry-run"], f"{s6_key}_dr")
                 st.rerun()
-            if step_output(s6_dr_key):
+            if step_output(f"{s6_key}_dr"):
                 any_running = True
         with col_ap:
             if st.button("Apply", key="btn_s6", disabled=is_running(s6_key)):
-                run_command(
-                    [PYTHON, "06_merge_into_xlsx.py", "--vol", str(vn)],
-                    s6_key,
-                )
+                run_command([PYTHON, "06_export_authority.py", "--vol", str(vn)], s6_key)
                 st.rerun()
             if step_output(s6_key):
                 any_running = True
 
-    # ── Keep polling while any step is running ────────────────────────────────
     if any_running:
         time.sleep(0.5)
         st.rerun()
 
 
-# ── tab 1: review queue ───────────────────────────────────────────────────────
+with tab_pipeline:
+    render_pipeline_tab()
 
-with tab_queue:
-    qkey = f"{vol}_queue"
-    if qkey not in st.session_state:
-        st.session_state[qkey] = load_csv(queue_path, add_cols={"decision": ""})
 
-    df_q = st.session_state[qkey]
+# ── tab: charters ────────────────────────────────────────────────────────────
 
-    if df_q.empty:
-        st.info("No review queue for this volume. Run pipeline steps 3 and 5 first.")
+with tab_charters:
+    undo_widget("charters")
+    flagged_only = st.checkbox("Flagged only", value=True, key="charters_flagged_only")
+    ckey = f"{vol}_charters"
+
+    df_c = db.get_charters(volume=vn, has_review=(True if flagged_only else None))
+    if df_c.empty:
+        st.info("No charters" + (" match this filter" if flagged_only else "") + " for this volume.")
     else:
-        n_done = (df_q["decision"].str.strip() != "").sum()
-        st.caption(
-            f"**{n_done} / {len(df_q)}** decisions recorded — "
-            "click column headers to sort · edit the **Decision** column"
-        )
+        def _status_badge(r):
+            parts = []
+            if r["has_parse_error"]:
+                parts.append("Parse error")
+            if r["has_review_persons"]:
+                parts.append("Unresolved persons")
+            if r["has_review_places"]:
+                parts.append("Unresolved places")
+            return " + ".join(parts) if parts else "OK"
 
-        edited_q = st.data_editor(
-            df_q,
-            key=f"ed_{qkey}",
-            use_container_width=True,
-            num_rows="fixed",
-            hide_index=True,
+        df_c = df_c.copy()
+        df_c["Status"] = df_c.apply(_status_badge, axis=1)
+
+        editable_cols = ["date", "date_uncertain", "doc_type", "subject", "outcome",
+                          "scribe", "scribe_source", "seal_info", "language"]
+        readonly_cols = ["charter_pk", "sequence", "di_reference", "Status", "notes"]
+        # Snapshot the SAME column subset handed to the editor below -- snapshotting
+        # the full fetched frame here would make is_dirty() always report dirty
+        # (column-set mismatch always fails .equals()).
+        ensure_snapshot(ckey, df_c[readonly_cols + editable_cols])
+
+        mv = mergever(ckey)
+        edited_c = st.data_editor(
+            df_c[readonly_cols + editable_cols],
+            key=f"ed_{ckey}_{mv}",
+            use_container_width=True, num_rows="fixed", hide_index=True,
             column_config={
-                "type": st.column_config.TextColumn("Type", width="small", disabled=True),
-                "extracted_name": st.column_config.TextColumn(
-                    "Extracted name", width="medium", disabled=True
-                ),
-                "closest_match": st.column_config.TextColumn(
-                    "Closest match", width="medium", disabled=True
-                ),
-                "match_id": st.column_config.TextColumn(
-                    "Proposed ID", width="small", disabled=True
-                ),
-                "score": st.column_config.NumberColumn(
-                    "Score", format="%.1f", width="small", disabled=True
-                ),
-                "role_category": st.column_config.TextColumn(
-                    "Role", width="small", disabled=True
-                ),
-                "role": st.column_config.TextColumn(
-                    "Place role", width="small", disabled=True
-                ),
-                "charter_filename": st.column_config.TextColumn(
-                    "Charter", width="small", disabled=True
-                ),
-                "charter_date": st.column_config.TextColumn(
-                    "Date", width="small", disabled=True
-                ),
-                "decision": st.column_config.SelectboxColumn(
-                    "Decision",
-                    options=["", "accept", "reject"],
-                    width="small",
-                    help="accept = use proposed ID  ·  reject = treat as new entity",
-                ),
+                "charter_pk": None,
+                "sequence": st.column_config.NumberColumn("Seq", width="small", disabled=True),
+                "di_reference": st.column_config.TextColumn("DI ref.", width="medium", disabled=True),
+                "Status": st.column_config.TextColumn("Status", width="medium", disabled=True),
+                "notes": st.column_config.TextColumn("Notes (diagnostic)", width="large", disabled=True),
+                "date": st.column_config.TextColumn("Date", width="small"),
+                "date_uncertain": st.column_config.TextColumn("Uncertain?", width="small"),
+                "doc_type": st.column_config.TextColumn("Doc type", width="small"),
+                "subject": st.column_config.TextColumn("Subject", width="medium"),
+                "outcome": st.column_config.TextColumn("Outcome", width="medium"),
+                "scribe": st.column_config.TextColumn("Scribe", width="small"),
+                "scribe_source": st.column_config.TextColumn("Scribe source", width="small"),
+                "seal_info": st.column_config.TextColumn("Seal info", width="small"),
+                "language": st.column_config.TextColumn("Language", width="small"),
             },
         )
 
-        autosave(qkey, edited_q, queue_path)
-        st.session_state[qkey] = edited_q
+        def _apply_charters(edited_df):
+            def _update(pk, **changes):
+                row = df_c.loc[df_c["charter_pk"] == pk].iloc[0]
+                db.update_charter(int(row["volume"]), int(row["sequence"]), **changes)
+            return apply_row_diffs(st.session_state[snap_key(ckey)], edited_df, "charter_pk",
+                                    _update, editable_cols)
+
+        dirty_c = is_dirty(ckey, edited_c)
+        save_button(ckey, edited_c, _apply_charters)
+
+        st.markdown("---")
+        st.caption("Row actions for still-flagged charters:")
+        for _, row in df_c[df_c["Status"] != "OK"].iterrows():
+            with st.container(border=True):
+                st.markdown(f"**Seq {row['sequence']}** ({row['di_reference'] or 'no DI ref.'}) — {row['Status']}")
+                b1, b2 = st.columns(2)
+                with b1:
+                    if row["has_review_persons"] or row["has_review_places"]:
+                        st.caption("→ Resolve the remaining item(s) in the **Review Queue** tab.")
+                with b2:
+                    if row["has_parse_error"]:
+                        if st.button(f"Re-extract seq {row['sequence']}", key=f"reextract_{row['charter_pk']}"):
+                            run_command(
+                                [PYTHON, "02_extract_entities.py", "--vol", str(vn),
+                                 "--start", str(row["sequence"]), "--end", str(row["sequence"])],
+                                f"reextract_{row['charter_pk']}",
+                            )
+                            st.info("Re-extraction started — re-run Step 3 and Step 5 in the "
+                                    "Pipeline tab afterward to bring it into the database.")
 
 
-# ── tab 2: new entities ───────────────────────────────────────────────────────
+# ── tab: review queue ────────────────────────────────────────────────────────
+
+with tab_queue:
+    undo_widget("queue")
+    sub_pending, sub_resolved = st.tabs(["Pending", "Resolved"])
+
+    with sub_pending:
+        qkey = f"{vol}_queue"
+        df_q = db.get_open_review_items(vn)
+        if df_q.empty:
+            st.info("No open review queue items for this volume.")
+        else:
+            ensure_snapshot(qkey, df_q)
+            mv = mergever(qkey)
+            edited_q = st.data_editor(
+                with_checkbox(df_q, "select"),
+                key=f"ed_{qkey}_{mv}",
+                use_container_width=True, num_rows="fixed", hide_index=True,
+                column_order=["select", "review_item_pk", "entity_type", "extracted_name",
+                              "closest_match", "match_pk", "score", "role_category", "role", "decision"],
+                column_config={
+                    "select": st.column_config.CheckboxColumn("Select", width="small"),
+                    "review_item_pk": None,
+                    "charter_pk": None, "charter_person_pk": None, "charter_place_pk": None,
+                    "outcome_pk": None, "status": None, "resolved_at": None,
+                    "created_at": None, "charter_date": None, "charter_volume": None,
+                    "entity_type": st.column_config.TextColumn("Type", width="small", disabled=True),
+                    "extracted_name": st.column_config.TextColumn("Extracted name", width="medium", disabled=True),
+                    "closest_match": st.column_config.TextColumn("Closest match", width="medium", disabled=True),
+                    "match_pk": st.column_config.NumberColumn("Proposed pk", width="small", disabled=True),
+                    "score": st.column_config.NumberColumn("Score", format="%.1f", width="small", disabled=True),
+                    "role_category": st.column_config.TextColumn("Role", width="small", disabled=True),
+                    "role": st.column_config.TextColumn("Place role", width="small", disabled=True),
+                    "decision": st.column_config.SelectboxColumn(
+                        "Decision", options=["", "accept", "reject"], width="small",
+                        help="accept = use proposed pk  ·  reject = treat as new entity",
+                    ),
+                },
+            )
+
+            n_done = (edited_q["decision"].fillna("").str.strip() != "").sum()
+            st.caption(f"**{n_done} / {len(edited_q)}** decisions recorded")
+
+            checked_idx = edited_q.index[edited_q["select"] == True].tolist()  # noqa: E712
+            col_pick, col_bulk, col_status = st.columns([1, 1, 4])
+            dirty_q = is_dirty(qkey, edited_q.drop(columns=["select"]))
+            with col_pick:
+                bulk_val = st.selectbox("Bulk decision", ["accept", "reject"],
+                                          key=f"bulkval_{qkey}", label_visibility="collapsed")
+            with col_bulk:
+                if st.button("Apply to selected", key=f"btn_bulk_{qkey}",
+                             disabled=dirty_q or len(checked_idx) < 2):
+                    for i in checked_idx:
+                        db.set_review_decision(int(edited_q.loc[i, "review_item_pk"]), bulk_val)
+                    bump(qkey)
+                    st.toast(f"Set decision='{bulk_val}' on {len(checked_idx)} row(s).")
+                    st.rerun()
+            with col_status:
+                if dirty_q:
+                    st.caption("Save your pending changes below before bulk-applying.")
+                elif len(checked_idx) >= 2:
+                    st.caption(f"{len(checked_idx)} rows checked.")
+
+            def _apply_queue(edited_df):
+                # edited_df here is already the post-drop frame save_button()
+                # was called with below -- dropping "select" again would KeyError.
+                def _update(pk, **changes):
+                    db.set_review_decision(pk, changes["decision"])
+                return apply_row_diffs(st.session_state[snap_key(qkey)],
+                                        edited_df, "review_item_pk", _update, ["decision"])
+            save_button(qkey, edited_q.drop(columns=["select"]), _apply_queue)
+
+            st.markdown("---")
+            if st.button("Resolve decided rows", key=f"btn_resolve_{qkey}", type="primary",
+                         disabled=dirty_q):
+                accepted = rejected = 0
+                for _, row in edited_q.iterrows():
+                    if (row["decision"] or "").strip().lower() in ("accept", "reject"):
+                        result = db.apply_review_decision(int(row["review_item_pk"]))
+                        if result.get("decision") == "accept":
+                            accepted += 1
+                        elif result.get("decision") == "reject":
+                            rejected += 1
+                bump(qkey, f"{vol}_persons", f"{vol}_places")
+                st.toast(f"Accepted {accepted}, rejected {rejected}.")
+                st.rerun()
+
+    with sub_resolved:
+        df_r = db.get_resolved_review_items(vn)
+        if df_r.empty:
+            st.info("No rows resolved yet for this volume.")
+        else:
+            st.caption(f"**{len(df_r)}** row(s) resolved — read-only archive.")
+            st.dataframe(
+                df_r[["entity_type", "extracted_name", "closest_match", "decision", "outcome_pk", "resolved_at"]],
+                use_container_width=True, hide_index=True,
+            )
+
+
+# ── tab: new entities ────────────────────────────────────────────────────────
 
 with tab_entities:
+    undo_widget("entities")
     sub_p, sub_pl = st.tabs(["Persons", "Places"])
 
-    # ── persons ──────────────────────────────────────────────────────────────
     with sub_p:
         pkey = f"{vol}_persons"
-        if pkey not in st.session_state:
-            st.session_state[pkey] = load_csv(
-                persons_path, add_cols={"review_status": "", "wikidata_id": ""}
-            )
-
-        df_p = st.session_state[pkey]
-
+        df_p = db.get_persons(status="provisional", source_volume=vn)
         if df_p.empty:
-            st.info("No new persons for this volume. Run pipeline steps 3 and 5 first.")
+            st.info("No new persons for this volume.")
         else:
-            n_done = (df_p["review_status"].str.strip() != "").sum()
-            st.caption(
-                f"**{n_done} / {len(df_p)}** decisions recorded — "
-                "set **Status** for each row (ok / skip / add)"
-            )
+            df_p = blank_if_null(df_p, ["floruit_start", "floruit_end"])
+            ensure_snapshot(pkey, df_p)
+            mv = mergever(pkey)
+
+            editable_p = ["review_status", "canonical_name", "wikidata_id", "variant_names",
+                          "patronymic", "occupation", "title", "floruit_start", "floruit_end",
+                          "gender", "associated_places", "notes"]
 
             edited_p = st.data_editor(
-                with_wikidata_links(df_p),
-                key=f"ed_{pkey}",
-                use_container_width=True,
-                num_rows="fixed",
-                hide_index=True,
-                column_order=[
-                    "person_id", "review_status", "canonical_name",
-                    "wikidata_id", "wikidata_link",
-                    "variant_names", "patronymic", "occupation", "title",
-                    "floruit_start", "floruit_end", "gender",
-                    "associated_places", "notes", "sources",
-                ],
+                with_checkbox(with_wikidata_links(df_p), "select"),
+                key=f"ed_{pkey}_{mv}",
+                use_container_width=True, num_rows="fixed", hide_index=True,
+                column_order=["select", "person_pk", "display_id", "review_status", "canonical_name",
+                              "wikidata_id", "wikidata_link", "variant_names", "patronymic",
+                              "occupation", "title", "floruit_start", "floruit_end", "gender",
+                              "associated_places", "notes", "sources"],
                 column_config={
-                    "person_id": st.column_config.TextColumn(
-                        "ID", width="small", disabled=True
+                    "select": st.column_config.CheckboxColumn(
+                        "Select", width="small",
+                        help="Check 1 row to compare it against the authority below. Check 2+ to merge them.",
                     ),
+                    "person_pk": None,
+                    "display_id": st.column_config.TextColumn("ID", width="small", disabled=True),
                     "review_status": st.column_config.SelectboxColumn(
-                        "Status",
-                        options=["", "ok", "skip", "add"],
-                        width="small",
-                        help="ok = include in charter data  ·  add = also promote to authority file",
-                    ),
-                    "canonical_name": st.column_config.TextColumn(
-                        "Canonical name", width="medium"
-                    ),
-                    "wikidata_id": st.column_config.TextColumn(
-                        "Wikidata ID", width="small"
-                    ),
-                    "wikidata_link": st.column_config.LinkColumn(
-                        "Wikidata", width="small", disabled=True
-                    ),
-                    "variant_names": st.column_config.TextColumn(
-                        "Variants", width="large"
-                    ),
-                    "patronymic": st.column_config.TextColumn(
-                        "Patronymic", width="small"
-                    ),
-                    "occupation": st.column_config.TextColumn(
-                        "Occupation", width="medium"
-                    ),
+                        "Status", options=["", "ok", "skip", "add"], width="small"),
+                    "canonical_name": st.column_config.TextColumn("Canonical name", width="medium"),
+                    "wikidata_id": st.column_config.TextColumn("Wikidata ID", width="small"),
+                    "wikidata_link": st.column_config.LinkColumn("Wikidata", width="small", disabled=True),
+                    "variant_names": st.column_config.TextColumn("Variants", width="large"),
+                    "patronymic": st.column_config.TextColumn("Patronymic", width="small"),
+                    "occupation": st.column_config.TextColumn("Occupation", width="medium"),
                     "title": st.column_config.TextColumn("Title", width="small"),
-                    "floruit_start": st.column_config.TextColumn(
-                        "Fl. start", width="small"
-                    ),
-                    "floruit_end": st.column_config.TextColumn(
-                        "Fl. end", width="small"
-                    ),
-                    "gender": st.column_config.SelectboxColumn(
-                        "Gender",
-                        options=["", "M", "F", "unknown"],
-                        width="small",
-                    ),
-                    "associated_places": st.column_config.TextColumn(
-                        "Places", width="medium"
-                    ),
+                    "floruit_start": st.column_config.TextColumn("Fl. start", width="small"),
+                    "floruit_end": st.column_config.TextColumn("Fl. end", width="small"),
+                    "gender": st.column_config.SelectboxColumn("Gender", options=["", "M", "F", "unknown"], width="small"),
+                    "associated_places": st.column_config.TextColumn("Places", width="medium"),
                     "notes": st.column_config.TextColumn("Notes", width="large"),
-                    "sources": st.column_config.TextColumn(
-                        "Sources", width="small", disabled=True
-                    ),
+                    "sources": st.column_config.TextColumn("Sources", width="small", disabled=True),
                 },
             )
 
-            save_p = edited_p.drop(columns=["wikidata_link"])
-            autosave(pkey, save_p, persons_path)
-            st.session_state[pkey] = save_p
+            counts = edited_p["review_status"].fillna("").value_counts()
+            st.caption(f"ok: {counts.get('ok', 0)} · skip: {counts.get('skip', 0)} · "
+                       f"add: {counts.get('add', 0)} · blank: {counts.get('', 0)} "
+                       "— blank behaves like **ok** at export time.")
 
-    # ── places ───────────────────────────────────────────────────────────────
+            checked_p = edited_p.loc[edited_p["select"] == True, "person_pk"].tolist()  # noqa: E712
+            dirty_p = is_dirty(pkey, edited_p.drop(columns=["select", "wikidata_link"]))
+
+            c1, c2 = st.columns([1, 4])
+            with c1:
+                if st.button("Merge selected", key="btn_merge_p",
+                             disabled=dirty_p or len(checked_p) < 2):
+                    survivor = min(checked_p)
+                    dropped = [pk for pk in checked_p if pk != survivor]
+                    result = db.merge_persons(survivor, dropped)
+                    bump(pkey)
+                    st.toast(f"Merged {len(dropped)} row(s) into person_pk={survivor}.")
+                    st.rerun()
+            with c2:
+                if dirty_p:
+                    st.caption("Save pending changes before comparing/merging.")
+                elif len(checked_p) == 1:
+                    st.caption("Comparing the checked row against the authority below. "
+                               "Check a 2nd row instead to merge them.")
+                elif len(checked_p) >= 2:
+                    st.caption(f"{len(checked_p)} rows selected — will merge into the lowest pk.")
+
+            if len(checked_p) == 1 and not dirty_p:
+                with st.container(border=True):
+                    st.caption("Compare with authority")
+                    render_compare_from_lookup("person", checked_p[0], key_suffix="_p")
+
+            def _apply_persons(edited_df):
+                # edited_df is already the post-drop frame save_button() was
+                # called with below -- dropping select/wikidata_link again
+                # would KeyError since they're already gone.
+                def _update(pk, **changes):
+                    if "floruit_start" in changes:
+                        changes["floruit_start"] = db.to_int_or_none(changes["floruit_start"])
+                    if "floruit_end" in changes:
+                        changes["floruit_end"] = db.to_int_or_none(changes["floruit_end"])
+                    db.update_person(pk, **changes)
+                return apply_row_diffs(st.session_state[snap_key(pkey)],
+                                        edited_df, "person_pk", _update, editable_p)
+            save_button(pkey, edited_p.drop(columns=["select", "wikidata_link"]), _apply_persons)
+
     with sub_pl:
         plkey = f"{vol}_places"
-        if plkey not in st.session_state:
-            st.session_state[plkey] = load_csv(
-                places_path, add_cols={"review_status": "", "wikidata_id": ""}
-            )
-
-        df_pl = st.session_state[plkey]
-
+        df_pl = db.get_places(status="provisional", source_volume=vn)
         if df_pl.empty:
-            st.info("No new places for this volume. Run pipeline steps 3 and 5 first.")
+            st.info("No new places for this volume.")
         else:
-            n_done = (df_pl["review_status"].str.strip() != "").sum()
-            st.caption(
-                f"**{n_done} / {len(df_pl)}** decisions recorded — "
-                "set **Status** for each row (ok / skip / add)"
-            )
+            df_pl = blank_if_null(df_pl, ["coordinates_lat", "coordinates_long", "geo_match_score"])
+            ensure_snapshot(plkey, df_pl)
+            mv = mergever(plkey)
+
+            editable_pl = ["review_status", "canonical_name", "wikidata_id", "nafnid_id",
+                           "variant_names", "place_type", "coordinates_lat", "coordinates_long",
+                           "region", "district", "modern_equivalent", "notes"]
 
             edited_pl = st.data_editor(
-                with_wikidata_links(df_pl),
-                key=f"ed_{plkey}",
-                use_container_width=True,
-                num_rows="fixed",
-                hide_index=True,
-                column_order=[
-                    "place_id", "review_status", "canonical_name",
-                    "wikidata_id", "wikidata_link",
-                    "variant_names", "place_type",
-                    "coordinates_lat", "coordinates_long",
-                    "region", "district", "modern_equivalent", "notes", "sources",
-                ],
+                with_checkbox(with_wikidata_links(df_pl), "select"),
+                key=f"ed_{plkey}_{mv}",
+                use_container_width=True, num_rows="fixed", hide_index=True,
+                column_order=["select", "place_pk", "display_id", "review_status", "canonical_name",
+                              "wikidata_id", "wikidata_link", "nafnid_id", "variant_names", "place_type",
+                              "coordinates_lat", "coordinates_long", "region", "district",
+                              "modern_equivalent", "notes", "sources"],
                 column_config={
-                    "place_id": st.column_config.TextColumn(
-                        "ID", width="small", disabled=True
-                    ),
+                    "select": st.column_config.CheckboxColumn(
+                        "Select", width="small",
+                        help="Check 1 row to compare it against the authority below. Check 2+ to merge them."),
+                    "place_pk": None,
+                    "display_id": st.column_config.TextColumn("ID", width="small", disabled=True),
                     "review_status": st.column_config.SelectboxColumn(
-                        "Status",
-                        options=["", "ok", "skip", "add"],
-                        width="small",
-                        help="ok = include in charter data  ·  add = also promote to authority file",
-                    ),
-                    "canonical_name": st.column_config.TextColumn(
-                        "Canonical name", width="medium"
-                    ),
-                    "wikidata_id": st.column_config.TextColumn(
-                        "Wikidata ID", width="small"
-                    ),
-                    "wikidata_link": st.column_config.LinkColumn(
-                        "Wikidata", width="small", disabled=True
-                    ),
-                    "variant_names": st.column_config.TextColumn(
-                        "Variants", width="large"
-                    ),
-                    "place_type": st.column_config.TextColumn(
-                        "Type", width="small"
-                    ),
-                    "coordinates_lat": st.column_config.TextColumn(
-                        "Lat", width="small"
-                    ),
-                    "coordinates_long": st.column_config.TextColumn(
-                        "Lon", width="small"
-                    ),
+                        "Status", options=["", "ok", "skip", "add", "no_match"], width="small"),
+                    "canonical_name": st.column_config.TextColumn("Canonical name", width="medium"),
+                    "wikidata_id": st.column_config.TextColumn("Wikidata ID", width="small"),
+                    "wikidata_link": st.column_config.LinkColumn("Wikidata", width="small", disabled=True),
+                    "nafnid_id": st.column_config.TextColumn("nafnid ID", width="small"),
+                    "variant_names": st.column_config.TextColumn("Variants", width="large"),
+                    "place_type": st.column_config.TextColumn("Type", width="small"),
+                    "coordinates_lat": st.column_config.TextColumn("Lat", width="small"),
+                    "coordinates_long": st.column_config.TextColumn("Lon", width="small"),
                     "region": st.column_config.TextColumn("Region", width="small"),
-                    "district": st.column_config.TextColumn(
-                        "District", width="small"
-                    ),
-                    "modern_equivalent": st.column_config.TextColumn(
-                        "Modern equiv.", width="medium"
-                    ),
+                    "district": st.column_config.TextColumn("District", width="small"),
+                    "modern_equivalent": st.column_config.TextColumn("Modern equiv.", width="medium"),
                     "notes": st.column_config.TextColumn("Notes", width="large"),
-                    "sources": st.column_config.TextColumn(
-                        "Sources", width="small", disabled=True
-                    ),
+                    "sources": st.column_config.TextColumn("Sources", width="small", disabled=True),
                 },
             )
 
-            save_pl = edited_pl.drop(columns=["wikidata_link"])
-            autosave(plkey, save_pl, places_path)
-            st.session_state[plkey] = save_pl
+            counts_pl = edited_pl["review_status"].fillna("").value_counts()
+            st.caption(f"ok: {counts_pl.get('ok', 0)} · skip: {counts_pl.get('skip', 0)} · "
+                       f"add: {counts_pl.get('add', 0)} · blank: {counts_pl.get('', 0)} "
+                       "— blank behaves like **ok** at export time.")
+
+            checked_pl = edited_pl.loc[edited_pl["select"] == True, "place_pk"].tolist()  # noqa: E712
+            dirty_pl = is_dirty(plkey, edited_pl.drop(columns=["select", "wikidata_link"]))
+
+            c1, c2 = st.columns([1, 4])
+            with c1:
+                if st.button("Merge selected", key="btn_merge_pl",
+                             disabled=dirty_pl or len(checked_pl) < 2):
+                    survivor = min(checked_pl)
+                    dropped = [pk for pk in checked_pl if pk != survivor]
+                    result = db.merge_places(survivor, dropped)
+                    bump(plkey)
+                    st.toast(f"Merged {len(dropped)} row(s) into place_pk={survivor}.")
+                    st.rerun()
+            with c2:
+                if dirty_pl:
+                    st.caption("Save pending changes before comparing/merging.")
+                elif len(checked_pl) == 1:
+                    st.caption("Comparing the checked row against the authority below. "
+                               "Check a 2nd row instead to merge them.")
+                elif len(checked_pl) >= 2:
+                    st.caption(f"{len(checked_pl)} rows selected — will merge into the lowest pk.")
+
+            if len(checked_pl) == 1 and not dirty_pl:
+                with st.container(border=True):
+                    st.caption("Compare with authority")
+                    render_compare_from_lookup("place", checked_pl[0], key_suffix="_pl")
+
+            def _apply_places(edited_df):
+                # edited_df is already the post-drop frame save_button() was
+                # called with below -- dropping select/wikidata_link again
+                # would KeyError since they're already gone.
+                def _update(pk, **changes):
+                    for f in ("coordinates_lat", "coordinates_long"):
+                        if f in changes:
+                            try:
+                                changes[f] = float(changes[f]) if str(changes[f]).strip() else None
+                            except ValueError:
+                                changes[f] = None
+                    name_changed = "canonical_name" in changes or "variant_names" in changes
+                    db.update_place(pk, **changes)
+                    if name_changed:
+                        db.reconcile_place_wikidata(pk)
+                return apply_row_diffs(st.session_state[snap_key(plkey)],
+                                        edited_df, "place_pk", _update, editable_pl)
+            save_button(plkey, edited_pl.drop(columns=["select", "wikidata_link"]), _apply_places)
 
 
-# ── tab 3: person duplicates ──────────────────────────────────────────────────
-# Cross-volume + authority person duplicate candidates from
-# 07_find_person_duplicates.py -- unlike every other tab, this is NOT scoped
-# to the sidebar's selected volume; it compares across every volume that's
-# been processed so far, plus the already-promoted authority. Marking a
-# decision here does not modify any other file -- confirmed merges (relinking
-# charter references, removing the duplicate row) are applied manually.
+# ── tab: person duplicates ─────────────────────────────────────────────────
 
 with tab_dupes:
+    undo_widget("person_dupes")
     st.caption(
-        "Compares every new-entity person across all processed volumes against "
-        "each other and against `person_names_authority.csv`, using name "
-        "similarity plus a ±30-year floruit tolerance. Flag-only: marking a "
-        "decision here never modifies charters.csv or the authority file."
+        "Compares every provisional person across all volumes against each other and "
+        "against the canonical authority. Flag-only: marking a decision here never "
+        "modifies any charter reference on its own."
     )
 
-    dup_run_key = "s7_dupes"
-    if st.button("Run duplicate finder", key="btn_s7", disabled=is_running(dup_run_key)):
-        st.session_state.pop("person_dupes", None)
-        run_command([PYTHON, "07_find_person_duplicates.py"], dup_run_key)
-        st.rerun()
-    still_running = step_output(dup_run_key)
-    if still_running:
-        time.sleep(0.5)
-        st.rerun()
+    @st.fragment
+    def render_duplicate_finder_control():
+        # Scoped to its own fragment for the same reason as the Pipeline tab
+        # (see render_pipeline_tab's comment): its poll loop must not trigger
+        # a full-page rerun that would reset unrelated state elsewhere.
+        dup_run_key = "s7_dupes"
+        if st.button("Run duplicate finder", key="btn_s7", disabled=is_running(dup_run_key)):
+            run_command([PYTHON, "07_find_person_duplicates.py"], dup_run_key)
+            st.rerun()
+        if step_output(dup_run_key):
+            time.sleep(0.5)
+            st.rerun()
 
-    dupes_path = config.REVIEW_DIR / "cross_volume_person_duplicates.csv"
+    render_duplicate_finder_control()
+
     dkey = "person_dupes"
-    if dkey not in st.session_state:
-        st.session_state[dkey] = load_csv(dupes_path, add_cols={"decision": ""})
-
-    df_dupes = st.session_state[dkey]
-
+    df_dupes = db.get_person_duplicate_candidates()
     if df_dupes.empty:
-        st.info(
-            "No duplicate candidates on file yet. Click **Run duplicate finder** above "
-            "(requires at least one volume's persons_new.csv or the authority file to exist)."
-        )
+        st.info("No duplicate candidates on file yet. Click **Run duplicate finder** above.")
     else:
-        n_done = (df_dupes["decision"].str.strip() != "").sum()
-        st.caption(
-            f"**{n_done} / {len(df_dupes)}** decisions recorded — "
-            "sorted highest-confidence first · edit the **Decision** column"
-        )
-
+        ensure_snapshot(dkey, df_dupes)
+        mv = mergever(dkey)
         edited_dupes = st.data_editor(
-            df_dupes,
-            key=f"ed_{dkey}",
-            use_container_width=True,
-            num_rows="fixed",
-            hide_index=True,
+            with_checkbox(df_dupes, "select"),
+            key=f"ed_{dkey}_{mv}",
+            use_container_width=True, num_rows="fixed", hide_index=True,
+            column_order=["select", "a_display_id", "a_canonical_name", "a_source", "a_floruit_start",
+                          "a_floruit_end", "a_occupation", "a_title", "b_display_id", "b_canonical_name",
+                          "b_source", "b_floruit_start", "b_floruit_end", "b_occupation", "b_title",
+                          "name_score", "date_status", "classification", "confidence", "decision"],
             column_config={
-                "a_id": st.column_config.TextColumn("A · ID", width="small", disabled=True),
-                "a_name": st.column_config.TextColumn("A · Name", width="medium", disabled=True),
+                "select": st.column_config.CheckboxColumn("Select", width="small"),
+                "candidate_pk": None, "person_a_pk": None, "person_b_pk": None, "decided_at": None, "created_at": None,
+                "a_display_id": st.column_config.TextColumn("A · ID", width="small", disabled=True),
+                "a_canonical_name": st.column_config.TextColumn("A · Name", width="medium", disabled=True),
                 "a_source": st.column_config.TextColumn("A · Source", width="small", disabled=True),
-                "a_floruit": st.column_config.TextColumn("A · Floruit", width="small", disabled=True),
+                "a_floruit_start": st.column_config.NumberColumn("A · Fl. start", width="small", disabled=True),
+                "a_floruit_end": st.column_config.NumberColumn("A · Fl. end", width="small", disabled=True),
                 "a_occupation": st.column_config.TextColumn("A · Occupation", width="medium", disabled=True),
                 "a_title": st.column_config.TextColumn("A · Title", width="medium", disabled=True),
-                "b_id": st.column_config.TextColumn("B · ID", width="small", disabled=True),
-                "b_name": st.column_config.TextColumn("B · Name", width="medium", disabled=True),
+                "b_display_id": st.column_config.TextColumn("B · ID", width="small", disabled=True),
+                "b_canonical_name": st.column_config.TextColumn("B · Name", width="medium", disabled=True),
                 "b_source": st.column_config.TextColumn("B · Source", width="small", disabled=True),
-                "b_floruit": st.column_config.TextColumn("B · Floruit", width="small", disabled=True),
+                "b_floruit_start": st.column_config.NumberColumn("B · Fl. start", width="small", disabled=True),
+                "b_floruit_end": st.column_config.NumberColumn("B · Fl. end", width="small", disabled=True),
                 "b_occupation": st.column_config.TextColumn("B · Occupation", width="medium", disabled=True),
                 "b_title": st.column_config.TextColumn("B · Title", width="medium", disabled=True),
                 "name_score": st.column_config.NumberColumn("Name score", format="%.0f", width="small", disabled=True),
@@ -749,54 +1139,207 @@ with tab_dupes:
                 "classification": st.column_config.TextColumn("Classification", width="medium", disabled=True),
                 "confidence": st.column_config.TextColumn("Confidence", width="small", disabled=True),
                 "decision": st.column_config.SelectboxColumn(
-                    "Decision",
-                    options=["", "same", "different"],
-                    width="small",
-                    help="same = confirmed duplicate, apply the merge manually  ·  different = false positive, dismiss",
-                ),
+                    "Decision", options=["", "same", "different"], width="small"),
             },
         )
 
-        autosave(dkey, edited_dupes, dupes_path)
-        st.session_state[dkey] = edited_dupes
+        n_done = (edited_dupes["decision"].fillna("").str.strip() != "").sum()
+        st.caption(f"**{n_done} / {len(edited_dupes)}** decisions recorded — sorted highest-confidence first")
+
+        def _apply_dupes(edited_df):
+            # edited_df is already the post-drop frame save_button() was
+            # called with below -- dropping "select" again would KeyError.
+            def _update(pk, **changes):
+                db.record_person_duplicate_decision(pk, changes["decision"])
+            return apply_row_diffs(st.session_state[snap_key(dkey)],
+                                    edited_df, "candidate_pk", _update, ["decision"])
+        dirty_d = is_dirty(dkey, edited_dupes.drop(columns=["select"]))
+        save_button(dkey, edited_dupes.drop(columns=["select"]), _apply_dupes)
+
+        checked_d = edited_dupes[edited_dupes["select"] == True]  # noqa: E712
+        st.markdown("---")
+        col_send, col_status = st.columns([1, 5])
+        with col_send:
+            if st.button("Send to Final Review", key="btn_send_final", disabled=dirty_d or checked_d.empty):
+                sent = skipped_not_different = 0
+                for _, row in checked_d.iterrows():
+                    if (row["decision"] or "").strip().lower() != "different":
+                        skipped_not_different += 1
+                        continue
+                    for pk in (row["person_a_pk"], row["person_b_pk"]):
+                        p = db.get_person_by_pk(int(pk))
+                        if p and p["status"] == "provisional":
+                            db.update_person(int(pk), review_status="add")
+                            sent += 1
+                st.toast(f"Marked {sent} person(s) review_status=add. "
+                         f"Skipped {skipped_not_different} not yet 'different'.")
+                st.rerun()
+        with col_status:
+            if not checked_d.empty:
+                st.caption(f"{len(checked_d)} row(s) checked — only rows marked "
+                           "**different** are sent; provisional sides get review_status=add.")
 
 
-# ── tab 4: authority browser ──────────────────────────────────────────────────
+# ── tab: place duplicates ────────────────────────────────────────────────────
+
+with tab_place_dupes:
+    undo_widget("place_dupes")
+    st.caption(
+        "Candidates from nafnid.is (Árnastofnun) reconciliation (Step 4a). No confirmed-'same' "
+        "signal exists yet, so these are always warnings in Final Review, never a hard block."
+    )
+    include_all = st.checkbox("Include all volumes", value=False, key="pd_include_all")
+
+    pdkey = "place_dupes" if include_all else f"{vol}_place_dupes"
+    df_pdupes = db.get_place_duplicate_candidates(volume=None if include_all else vn)
+    if df_pdupes.empty:
+        st.info("No place duplicate candidates on file. Run Step 4a in the Pipeline tab.")
+    else:
+        ensure_snapshot(pdkey, df_pdupes)
+        mv = mergever(pdkey)
+        edited_pdupes = st.data_editor(
+            with_checkbox(df_pdupes, "select"),
+            key=f"ed_{pdkey}_{mv}",
+            use_container_width=True, num_rows="fixed", hide_index=True,
+            column_order=["select", "display_id", "place_canonical_name", "source_volume", "di_name",
+                          "candidate_name", "candidate_rank", "name_score", "distance_km", "flag",
+                          "match_sources", "candidate_sysla", "decision"],
+            column_config={
+                "select": st.column_config.CheckboxColumn("Select", width="small"),
+                "candidate_pk": None, "place_pk": None, "di_sysla_given": None, "di_place_type": None,
+                "di_region": None, "wikidata_status": None, "candidate_nafnid": None,
+                "candidate_hreppur": None, "candidate_lat": None, "candidate_lng": None, "created_at": None,
+                "display_id": st.column_config.TextColumn("Place ID", width="small", disabled=True),
+                "place_canonical_name": st.column_config.TextColumn("DI place", width="medium", disabled=True),
+                "source_volume": st.column_config.NumberColumn("Vol", width="small", disabled=True),
+                "di_name": st.column_config.TextColumn("DI name", width="medium", disabled=True),
+                "candidate_name": st.column_config.TextColumn("nafnid candidate", width="medium", disabled=True),
+                "candidate_rank": st.column_config.NumberColumn("Rank", width="small", disabled=True),
+                "name_score": st.column_config.NumberColumn("Name score", format="%.1f", width="small", disabled=True),
+                "distance_km": st.column_config.NumberColumn("Dist. (km)", format="%.1f", width="small", disabled=True),
+                "flag": st.column_config.TextColumn("Flag", width="small", disabled=True),
+                "match_sources": st.column_config.TextColumn("Sources", width="small", disabled=True),
+                "candidate_sysla": st.column_config.TextColumn("Sýsla", width="small", disabled=True),
+                "decision": st.column_config.SelectboxColumn(
+                    "Decision", options=["", "same", "different"], width="small",
+                    help="same = confirmed match, backfills nafnid_id  ·  different = false positive"),
+            },
+        )
+
+        n_done = (edited_pdupes["decision"].fillna("").str.strip() != "").sum()
+        st.caption(f"**{n_done} / {len(edited_pdupes)}** decisions recorded — sorted highest-confidence first")
+
+        def _apply_pdupes(edited_df):
+            # edited_df is already the post-drop frame save_button() was
+            # called with below -- dropping "select" again would KeyError.
+            def _update(pk, **changes):
+                db.record_place_duplicate_decision(pk, changes["decision"])
+            return apply_row_diffs(st.session_state[snap_key(pdkey)],
+                                    edited_df, "candidate_pk", _update, ["decision"])
+        save_button(pdkey, edited_pdupes.drop(columns=["select"]), _apply_pdupes)
+
+
+# ── tab: final review ────────────────────────────────────────────────────────
+
+with tab_final:
+    undo_widget("final")
+    all_volumes = db.get_volumes()
+    rows = db.get_final_review_candidates(all_volumes) if all_volumes else []
+
+    n_persons = sum(1 for r in rows if r["entity_type"] == "person")
+    n_places = sum(1 for r in rows if r["entity_type"] == "place")
+    n_blocked = sum(1 for r in rows if r["duplicate_status"] == "blocked")
+    n_warning = sum(1 for r in rows if r["duplicate_status"] == "warning")
+
+    st.caption(
+        f"**{n_persons}** person(s), **{n_places}** place(s) ready to promote across "
+        f"**{len(all_volumes)}** volume(s) — **{n_blocked}** blocked, **{n_warning}** with warnings."
+    )
+
+    def _status_label(status: str) -> str:
+        return {"blocked": "BLOCKED — confirmed duplicate", "warning": "⚠ Unresolved duplicate"}.get(status, "Ready")
+
+    sub_final_p, sub_final_pl = st.tabs(["Persons", "Places"])
+
+    with sub_final_p:
+        person_rows = [r for r in rows if r["entity_type"] == "person"]
+        if not person_rows:
+            st.info("No persons currently marked review_status=add.")
+        else:
+            df_final_p = pd.DataFrame(person_rows)
+            df_final_p["Status"] = df_final_p["duplicate_status"].apply(_status_label)
+            for _, r in df_final_p.iterrows():
+                with st.container(border=True):
+                    st.markdown(f"**{r['id']}** — {r['canonical_name']}  (vol{r['volume']:02d})  ·  {r['Status']}")
+                    if r["duplicate_detail"]:
+                        st.caption(r["duplicate_detail"])
+                    if r["duplicate_status"] in ("warning", "blocked"):
+                        with st.expander("Compare with authority"):
+                            if r["duplicate_other_pk"]:
+                                render_compare_from_known("person", r["pk"], r["duplicate_other_pk"],
+                                                           key_suffix=f"_fr_{r['pk']}")
+                            else:
+                                render_compare_from_lookup("person", r["pk"], key_suffix=f"_fr_{r['pk']}")
+
+    with sub_final_pl:
+        place_rows = [r for r in rows if r["entity_type"] == "place"]
+        if not place_rows:
+            st.info("No places currently marked review_status=add.")
+        else:
+            df_final_pl = pd.DataFrame(place_rows)
+            df_final_pl["Status"] = df_final_pl["duplicate_status"].apply(_status_label)
+            for _, r in df_final_pl.iterrows():
+                with st.container(border=True):
+                    st.markdown(f"**{r['id']}** — {r['canonical_name']}  (vol{r['volume']:02d})  ·  {r['Status']}")
+                    if r["duplicate_detail"]:
+                        st.caption(r["duplicate_detail"])
+                    if r["duplicate_status"] in ("warning", "blocked"):
+                        with st.expander("Compare with authority"):
+                            render_compare_from_lookup("place", r["pk"], key_suffix=f"_fr_{r['pk']}")
+
+    if n_blocked:
+        st.caption("Rows marked BLOCKED will not be promoted until the duplicate is resolved.")
+
+    n_eligible = sum(1 for r in rows if r["duplicate_status"] != "blocked")
+    if st.button("Add to authority file", key="btn_final_promote", type="primary", disabled=n_eligible == 0):
+        result = db.promote_all(all_volumes)
+        p, pl = result["persons"], result["places"]
+        st.toast(
+            f"Added {len(p['added'])} person(s), {len(pl['added'])} place(s) to the authority. "
+            f"Skipped {len(p['skipped_blocked'])} blocked, "
+            f"{len(p['skipped_existing']) + len(pl['skipped_existing'])} already present."
+        )
+        st.rerun()
+
+
+# ── tab: authority browser ─────────────────────────────────────────────────
 
 with tab_authority:
-    search = st.text_input(
-        "Search",
-        placeholder="Filter by any field...",
-        key="auth_search",
-    )
+    search = st.text_input("Search", placeholder="Filter by any field...", key="auth_search")
     auth_pl_tab, auth_pe_tab = st.tabs(["Places", "Persons"])
 
     with auth_pl_tab:
-        auth_pl = load_csv(auth_pl_path)
-        if auth_pl.empty:
-            st.info("place_names_authority.csv not found.")
-        else:
-            if search:
-                mask = auth_pl.apply(
-                    lambda r: search.lower() in " ".join(r.values.astype(str)).lower(),
-                    axis=1,
-                )
-                auth_pl = auth_pl[mask]
-            st.caption(f"{len(auth_pl)} entries")
-            st.dataframe(auth_pl, use_container_width=True, hide_index=True)
+        auth_pl = db.get_places(status="canonical")
+        auth_pl = with_wikidata_links(auth_pl)
+        if search:
+            mask = auth_pl.apply(lambda r: search.lower() in " ".join(r.values.astype(str)).lower(), axis=1)
+            auth_pl = auth_pl[mask]
+        st.caption(f"{len(auth_pl)} entries")
+        st.dataframe(
+            auth_pl.drop(columns=["created_at", "updated_at"], errors="ignore"),
+            use_container_width=True, hide_index=True,
+            column_config={"wikidata_link": st.column_config.LinkColumn("Wikidata")},
+        )
 
     with auth_pe_tab:
-        auth_pe = load_csv(auth_pe_path)
-        if auth_pe.empty:
-            st.info(
-                "person_names_authority.csv not found -- run `seed_person_names.py` first."
-            )
-        else:
-            if search:
-                mask = auth_pe.apply(
-                    lambda r: search.lower() in " ".join(r.values.astype(str)).lower(),
-                    axis=1,
-                )
-                auth_pe = auth_pe[mask]
-            st.caption(f"{len(auth_pe)} entries")
-            st.dataframe(auth_pe, use_container_width=True, hide_index=True)
+        auth_pe = db.get_persons(status="canonical")
+        auth_pe = with_wikidata_links(auth_pe)
+        if search:
+            mask = auth_pe.apply(lambda r: search.lower() in " ".join(r.values.astype(str)).lower(), axis=1)
+            auth_pe = auth_pe[mask]
+        st.caption(f"{len(auth_pe)} entries")
+        st.dataframe(
+            auth_pe.drop(columns=["created_at", "updated_at"], errors="ignore"),
+            use_container_width=True, hide_index=True,
+            column_config={"wikidata_link": st.column_config.LinkColumn("Wikidata")},
+        )
