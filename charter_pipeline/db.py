@@ -186,6 +186,7 @@ def undo_last_action() -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_persons(status: str | None = None, source_volume: int | None = None,
+                 review_status: str | None = None,
                  conn: sqlite3.Connection | None = None) -> pd.DataFrame:
     own = conn is None
     conn = conn or get_connection()
@@ -195,6 +196,8 @@ def get_persons(status: str | None = None, source_volume: int | None = None,
             q += " AND status = ?"; params.append(status)
         if source_volume is not None:
             q += " AND source_volume = ?"; params.append(source_volume)
+        if review_status is not None:
+            q += " AND review_status = ?"; params.append(review_status)
         # ORDER BY is required, not cosmetic: without it SQLite doesn't
         # guarantee the same row order across two calls returning identical
         # rows, which broke UI dirty-checking (row-order-sensitive .equals())
@@ -459,6 +462,7 @@ def merge_persons(survivor_pk: int, dropped_pks: list[int]) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_places(status: str | None = None, source_volume: int | None = None,
+                review_status: str | None = None,
                 conn: sqlite3.Connection | None = None) -> pd.DataFrame:
     own = conn is None
     conn = conn or get_connection()
@@ -468,6 +472,8 @@ def get_places(status: str | None = None, source_volume: int | None = None,
             q += " AND status = ?"; params.append(status)
         if source_volume is not None:
             q += " AND source_volume = ?"; params.append(source_volume)
+        if review_status is not None:
+            q += " AND review_status = ?"; params.append(review_status)
         # See get_persons()'s comment -- ORDER BY is required for stable
         # row order across calls, not cosmetic.
         q += " ORDER BY place_pk"
@@ -1160,11 +1166,10 @@ def apply_review_decisions_for_volume(volume: int) -> dict:
 # Duplicate candidates
 # ═══════════════════════════════════════════════════════════════════════════
 
-def get_person_duplicate_candidates() -> pd.DataFrame:
+def get_person_duplicate_candidates(decision: str | None = None) -> pd.DataFrame:
     conn = get_connection()
     try:
-        return pd.read_sql_query(
-            """SELECT pdc.*,
+        q = """SELECT pdc.*,
                       pa.display_id AS a_display_id, pa.canonical_name AS a_canonical_name,
                       pa.occupation AS a_occupation, pa.title AS a_title,
                       pa.floruit_start AS a_floruit_start, pa.floruit_end AS a_floruit_end,
@@ -1178,9 +1183,12 @@ def get_person_duplicate_candidates() -> pd.DataFrame:
                FROM person_duplicate_candidates pdc
                JOIN persons pa ON pa.person_pk = pdc.person_a_pk
                JOIN persons pb ON pb.person_pk = pdc.person_b_pk
-               ORDER BY pdc.name_score DESC, pdc.candidate_pk""",
-            conn,
-        )
+               WHERE 1=1"""
+        params = []
+        if decision is not None:
+            q += " AND pdc.decision = ?"; params.append(decision)
+        q += " ORDER BY pdc.name_score DESC, pdc.candidate_pk"
+        return pd.read_sql_query(q, conn, params=params)
     finally:
         conn.close()
 
@@ -1235,7 +1243,7 @@ def record_person_duplicate_decision(candidate_pk: int, decision: str) -> None:
         conn.close()
 
 
-def get_place_duplicate_candidates(volume: int | None = None) -> pd.DataFrame:
+def get_place_duplicate_candidates(volume: int | None = None, decision: str | None = None) -> pd.DataFrame:
     conn = get_connection()
     try:
         q = """SELECT pdc.*, p.display_id, p.canonical_name AS place_canonical_name, p.source_volume
@@ -1244,6 +1252,8 @@ def get_place_duplicate_candidates(volume: int | None = None) -> pd.DataFrame:
         params = []
         if volume is not None:
             q += " AND p.source_volume = ?"; params.append(volume)
+        if decision is not None:
+            q += " AND pdc.decision = ?"; params.append(decision)
         q += " ORDER BY pdc.name_score DESC, pdc.candidate_pk"
         return pd.read_sql_query(q, conn, params=params)
     finally:

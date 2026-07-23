@@ -18,11 +18,16 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).parent))
 import config
 import db
+import diff_render
+import hotkeys
+import review_queue
+import ui_widgets
 
 PYTHON = sys.executable
 SCRIPTS = Path(__file__).parent
 
 st.set_page_config(page_title="DI Authority Review", layout="wide")
+st.markdown(diff_render.DIFF_CSS, unsafe_allow_html=True)
 
 
 # ── generic data/UI helpers ─────────────────────────────────────────────────
@@ -65,6 +70,22 @@ def is_dirty(session_key: str, edited: pd.DataFrame) -> bool:
 
 def mark_saved(session_key: str, edited: pd.DataFrame) -> None:
     st.session_state[snap_key(session_key)] = edited.copy()
+
+
+def reset_snapshot_on_filter_change(session_key: str, filter_sig) -> None:
+    """The dirty-check snapshot (ensure_snapshot/is_dirty) assumes the
+    underlying row set for session_key only changes when mergever bumps --
+    true before the filter toolbar existed, since every tab showed its whole
+    dataframe. Now that a filter toolbar can change which rows are visible on
+    an otherwise-ordinary rerun (no save, no bump), a stale snapshot from
+    before the filter changed would otherwise make is_dirty() spuriously
+    report unsaved changes (or worse, silently ignore edits to rows the old
+    snapshot never saw). Call this once, right after computing filter_sig and
+    before ensure_snapshot, to bump() the moment the filter itself changes."""
+    sig_key = f"_filtsig_{session_key}"
+    if st.session_state.get(sig_key) != filter_sig:
+        st.session_state[sig_key] = filter_sig
+        bump(session_key)
 
 
 def apply_row_diffs(before_df: pd.DataFrame, after_df: pd.DataFrame, id_col: str,
@@ -117,10 +138,26 @@ def with_wikidata_links(df: pd.DataFrame, id_col: str = "wikidata_id") -> pd.Dat
     return out
 
 
-def with_checkbox(df: pd.DataFrame, col_name: str = "select") -> pd.DataFrame:
+def with_checkbox(df: pd.DataFrame, session_key: str, pk_col: str, col_name: str = "select") -> pd.DataFrame:
+    """Seeds the select column from a session-state-backed set of checked pks
+    instead of a hardcoded False -- unlike a bare data_editor checkbox column
+    (whose checked state lives only in the widget's own ephemeral state), this
+    set survives the bump()-triggered widget-key remount every Save button
+    causes, so checking rows then saving unrelated edits no longer silently
+    clears the selection. Call sync_checked_pks() right after the matching
+    st.data_editor call to keep the set in sync with in-grid clicks."""
+    checked = st.session_state.setdefault(f"_checked_pks_{session_key}", set())
     out = df.copy()
-    out.insert(0, col_name, False)
+    out.insert(0, col_name, out[pk_col].isin(checked) if pk_col in out.columns else False)
     return out
+
+
+def sync_checked_pks(session_key: str, edited_df: pd.DataFrame, pk_col: str, col_name: str = "select") -> None:
+    """Call immediately after the st.data_editor call that used with_checkbox,
+    before any bump() -- persists whatever's currently checked in the grid
+    into the session-state set with_checkbox() reads from on the next render."""
+    st.session_state[f"_checked_pks_{session_key}"] = set(
+        edited_df.loc[edited_df[col_name] == True, pk_col].tolist())  # noqa: E712
 
 
 def blank_if_null(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
@@ -225,128 +262,6 @@ def run_sync(cmd: list[str]) -> tuple[int, str]:
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
-# ── compare panel (plan section 2.3) ────────────────────────────────────────
-
-_COMPARE_ROWS = {
-    "person": [
-        ("Name", "canonical_name", "canonical_name"),
-        ("Variants", "variant_names", "variant_names"),
-        ("Occupation", "occupation", "occupation"),
-        ("Title", "title", "title"),
-        ("Floruit", ("floruit_start", "floruit_end"), ("floruit_start", "floruit_end")),
-        ("Notes", "notes", "notes"),
-        ("Sources", "sources", "sources"),
-    ],
-    "place": [
-        ("Name", "canonical_name", "canonical_name"),
-        ("Variants", "variant_names", "variant_names"),
-        ("Type", "place_type", "place_type"),
-        ("Region", "region", "region"),
-        ("Coordinates", ("coordinates_lat", "coordinates_long"), ("coordinates_lat", "coordinates_long")),
-        ("Notes", "notes", "notes"),
-        ("Sources", "sources", "sources"),
-    ],
-}
-
-
-def render_compare_panel(entity_type: str, candidate_pk: int, authority_options: list[dict],
-                          key_suffix: str = "") -> None:
-    """Inline (NOT a modal) comparison of a candidate person/place against its
-    likely authority match(es). Rendered directly in the normal page flow --
-    right where a reviewer is already looking at the row -- so it reads as
-    part of reviewing entries rather than a separate action you have to
-    summon and then dismiss. key_suffix keeps widget keys unique when this
-    renders inside a per-row loop (e.g. Final Review)."""
-    candidate = (db.get_person_by_pk(candidate_pk) if entity_type == "person"
-                 else db.get_place_by_pk(candidate_pk))
-    if candidate is None:
-        st.error("This row no longer exists (it may have just been merged or promoted).")
-        return
-
-    if not authority_options:
-        st.info("No plausible authority match found for this name.")
-        return
-
-    # person_pk and place_pk are separate autoincrement sequences, so the same
-    # integer can legitimately identify one person AND one place -- entity_type
-    # must be part of every widget key here, not just candidate_pk, or a
-    # coincidental collision between the two tables raises
-    # StreamlitDuplicateElementKey the moment both happen to render in the
-    # same script run (e.g. one in New Entities, one in Final Review).
-    key_base = f"{entity_type}_{candidate_pk}{key_suffix}"
-
-    labels = [f"{o['display_id']} — {o['canonical_name']}"
-              + (f"  (score {o['_match_score']:.0f})" if "_match_score" in o else "")
-              for o in authority_options]
-    idx = st.selectbox("Authority match", range(len(labels)), format_func=lambda i: labels[i],
-                        key=f"cmp_match_{key_base}")
-    match = authority_options[idx]
-
-    st.markdown(f"**Candidate** (`{candidate['display_id']}`, {candidate['status']}) "
-                f"vs. **Authority** (`{match['display_id']}`)")
-
-    rows = _COMPARE_ROWS[entity_type]
-    left_col, mid_col, right_col = st.columns([3, 1, 3])
-    with left_col:
-        st.caption("Candidate")
-    with right_col:
-        st.caption("Authority match")
-
-    def _blank(v) -> str:
-        # match's values come from a pandas DataFrame (db.search_authority) --
-        # NaN is truthy in Python, so `v or ""` doesn't catch it and str(nan)
-        # renders the literal text "nan". candidate's values come straight
-        # from sqlite3.Row (proper None), where this is a no-op.
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return ""
-        return str(v)
-
-    for label, cand_keys, match_keys in rows:
-        if isinstance(cand_keys, tuple):
-            cand_val = " – ".join(_blank(candidate.get(k)) for k in cand_keys)
-            match_val = " – ".join(_blank(match.get(k)) for k in match_keys)
-        else:
-            cand_val = _blank(candidate.get(cand_keys))
-            match_val = _blank(match.get(match_keys))
-        c1, c2, c3 = st.columns([3, 1, 3])
-        with c1:
-            st.text(cand_val or "—")
-        with c2:
-            st.markdown("✓" if cand_val.strip().lower() == match_val.strip().lower() and cand_val.strip() else "≠")
-        with c3:
-            st.text(match_val or "—")
-
-    b1, b2 = st.columns(2)
-    with b1:
-        if st.button("Same — merge into authority", type="primary", key=f"cmp_same_{key_base}"):
-            db.merge_into_authority(entity_type, candidate_pk,
-                                     match["person_pk" if entity_type == "person" else "place_pk"])
-            st.toast("Merged into authority.")
-            st.rerun()
-    with b2:
-        if st.button("Genuinely new — confirm", key=f"cmp_new_{key_base}"):
-            if entity_type == "person":
-                db.update_person(candidate_pk, review_status="add")
-            else:
-                db.update_place(candidate_pk, review_status="add")
-            st.toast("Marked review_status=add.")
-            st.rerun()
-
-
-def render_compare_from_lookup(entity_type: str, candidate_pk: int, key_suffix: str = "") -> None:
-    candidate = (db.get_person_by_pk(candidate_pk) if entity_type == "person"
-                 else db.get_place_by_pk(candidate_pk))
-    if candidate is None:
-        return
-    options = db.search_authority(entity_type, candidate["canonical_name"], limit=3)
-    render_compare_panel(entity_type, candidate_pk, options, key_suffix)
-
-
-def render_compare_from_known(entity_type: str, candidate_pk: int, other_pk: int, key_suffix: str = "") -> None:
-    other = db.get_person_by_pk(other_pk) if entity_type == "person" else db.get_place_by_pk(other_pk)
-    render_compare_panel(entity_type, candidate_pk, [other] if other else [], key_suffix)
-
-
 # ── sidebar ──────────────────────────────────────────────────────────────────
 
 st.title("DI Authority Review")
@@ -369,8 +284,9 @@ st.sidebar.caption(
     "the Volume selector above does not filter those tabs."
 )
 
-tab_pipeline, tab_charters, tab_queue, tab_entities, tab_dupes, tab_place_dupes, tab_final, tab_authority = st.tabs(
-    ["Pipeline", "Charters", "Review Queue", "New Entities",
+(tab_pipeline, tab_review, tab_charters, tab_queue, tab_entities, tab_dupes,
+ tab_place_dupes, tab_final, tab_authority) = st.tabs(
+    ["Pipeline", "Review", "Charters", "Review Queue", "New Entities",
      "Person Duplicates", "Place Duplicates", "Final Review", "Authority Browser"]
 )
 
@@ -695,6 +611,107 @@ with tab_pipeline:
     render_pipeline_tab()
 
 
+# ── tab: review (unified card queue) ────────────────────────────────────────
+#
+# Primary review workflow: surfaces every pending decision -- new-entity
+# curation, person/place duplicate candidates, review-queue items -- as one
+# card at a time, with a shared char-level diff (diff_render.py) and hotkey
+# labels. The 8 tabs below this one remain as browse/bulk-edit/audit
+# surfaces; this tab is purely additive on top of them (plan section 5).
+
+_QUEUE_TYPE_LABELS = {
+    "new_person": "New person", "new_place": "New place",
+    "person_dup": "Person duplicate", "place_dup": "Place duplicate",
+    "review_item": "Review queue item",
+}
+
+with tab_review:
+    undo_widget("review")
+    st.caption(
+        "Works through every pending decision -- new entities, person/place "
+        "duplicate candidates, and review-queue items -- one at a time."
+    )
+
+    fcol1, fcol2 = st.columns([2, 3])
+    with fcol1:
+        rq_volumes = st.multiselect(
+            "Volumes (blank = all)", volumes, default=[],
+            format_func=lambda v: f"vol{v:02d}", key="rq_volumes")
+    with fcol2:
+        rq_types = st.multiselect(
+            "Item types", list(review_queue.ALL_ITEM_TYPES),
+            default=list(review_queue.ALL_ITEM_TYPES),
+            format_func=lambda t: _QUEUE_TYPE_LABELS[t], key="rq_types")
+    rq_tb = ui_widgets.render_filter_toolbar(
+        "review_queue", sort_options=ui_widgets.SCORE_SORT_OPTIONS)
+
+    rq_filt = review_queue.QueueFilter(
+        volumes=rq_volumes or None,
+        item_types=set(rq_types) if rq_types else set(review_queue.ALL_ITEM_TYPES),
+        search=rq_tb["search"], sort=rq_tb["sort"],
+    )
+
+    rq_filt_sig = (tuple(sorted(rq_filt.volumes or [])), tuple(sorted(rq_filt.item_types)),
+                   rq_filt.search, rq_filt.sort)
+    if st.session_state.get("_queue_filter_sig") != rq_filt_sig:
+        st.session_state["_queue_filter_sig"] = rq_filt_sig
+        st.session_state["_queue_pos"] = 0
+
+    rq_items = review_queue.build_queue(rq_filt)
+    rq_pos = st.session_state.get("_queue_pos", 0)
+
+    if not rq_items:
+        st.success("Queue complete for this filter. 🎉")
+    else:
+        rq_pos = max(0, min(rq_pos, len(rq_items) - 1))
+        st.session_state["_queue_pos"] = rq_pos
+        rq_item = rq_items[rq_pos]
+
+        st.progress((rq_pos + 1) / len(rq_items))
+        st.caption(f"**{rq_pos + 1} / {len(rq_items)}** in queue — "
+                   f"{_QUEUE_TYPE_LABELS[rq_item.item_type]}"
+                   + (f" · vol{rq_item.volume:02d}" if rq_item.volume else ""))
+
+        with st.container(border=True):
+            st.markdown(f"#### {rq_item.header}")
+            st.caption(rq_item.subheader)
+            diff_render.render_diff_table(rq_item.diff_rows, rq_item.left_label, rq_item.right_label)
+
+            btn_cols = st.columns(len(rq_item.actions))
+            # Widget key is the action name ALONE (stable across items/reruns),
+            # not item_id -- item_id contains a literal ":" (e.g.
+            # "new_place:157"), invalid inside the CSS class selector
+            # hotkeys.bind_hotkeys builds from it. One bind_hotkeys() call per
+            # render (below), not one per button, keeps this to a single
+            # extra invisible iframe -- with one iframe per button (an
+            # earlier attempt using the third-party streamlit-shortcuts
+            # package), keyboard focus intermittently got captured by one of
+            # the many 0-height iframes and real keydown events then never
+            # reached the page-level listener at all.
+            action_hotkeys = {}
+            for col, rq_action in zip(btn_cols, rq_item.actions):
+                with col:
+                    clicked = st.button(
+                        rq_action.label, key=f"rq_act_{rq_action.action}",
+                        type="primary" if rq_action.style == "primary" else "secondary",
+                    )
+                    action_hotkeys[f"rq_act_{rq_action.action}"] = rq_action.hotkey
+                    if clicked:
+                        if rq_action.action == "next":
+                            # This item stays in the live queue (nothing was
+                            # decided) -- explicitly advance position, unlike
+                            # every other action, where the acted-on item
+                            # drops out of build_queue()'s result on its own
+                            # and the same index naturally lands on the next
+                            # item for free.
+                            st.session_state["_queue_pos"] = rq_pos + 1
+                        else:
+                            review_queue.apply_action(rq_item, rq_action.action)
+                            st.toast(f"{rq_action.label.split(' (')[0]} — done.")
+                        st.rerun()
+            hotkeys.bind_hotkeys(action_hotkeys)
+
+
 # ── tab: charters ────────────────────────────────────────────────────────────
 
 with tab_charters:
@@ -702,83 +719,94 @@ with tab_charters:
     flagged_only = st.checkbox("Flagged only", value=True, key="charters_flagged_only")
     ckey = f"{vol}_charters"
 
-    df_c = db.get_charters(volume=vn, has_review=(True if flagged_only else None))
-    if df_c.empty:
+    df_c_all = db.get_charters(volume=vn, has_review=(True if flagged_only else None))
+    if df_c_all.empty:
         st.info("No charters" + (" match this filter" if flagged_only else "") + " for this volume.")
     else:
-        def _status_badge(r):
-            parts = []
-            if r["has_parse_error"]:
-                parts.append("Parse error")
-            if r["has_review_persons"]:
-                parts.append("Unresolved persons")
-            if r["has_review_places"]:
-                parts.append("Unresolved places")
-            return " + ".join(parts) if parts else "OK"
+        tb_c = ui_widgets.render_filter_toolbar(ckey)
+        df_c = ui_widgets.filter_dataframe(
+            df_c_all, search=tb_c["search"],
+            search_cols=["doc_type", "subject", "outcome", "scribe", "di_reference"])
+        if tb_c["sort"] == "name":
+            df_c = df_c.sort_values("sequence")
+        if df_c.empty:
+            st.info("No rows match this filter.")
+        else:
+            def _status_badge(r):
+                parts = []
+                if r["has_parse_error"]:
+                    parts.append("Parse error")
+                if r["has_review_persons"]:
+                    parts.append("Unresolved persons")
+                if r["has_review_places"]:
+                    parts.append("Unresolved places")
+                return " + ".join(parts) if parts else "OK"
 
-        df_c = df_c.copy()
-        df_c["Status"] = df_c.apply(_status_badge, axis=1)
+            df_c = df_c.copy()
+            df_c["Status"] = df_c.apply(_status_badge, axis=1)
 
-        editable_cols = ["date", "date_uncertain", "doc_type", "subject", "outcome",
-                          "scribe", "scribe_source", "seal_info", "language"]
-        readonly_cols = ["charter_pk", "sequence", "di_reference", "Status", "notes"]
-        # Snapshot the SAME column subset handed to the editor below -- snapshotting
-        # the full fetched frame here would make is_dirty() always report dirty
-        # (column-set mismatch always fails .equals()).
-        ensure_snapshot(ckey, df_c[readonly_cols + editable_cols])
+            editable_cols = ["date", "date_uncertain", "doc_type", "subject", "outcome",
+                              "scribe", "scribe_source", "seal_info", "language"]
+            readonly_cols = ["charter_pk", "sequence", "di_reference", "Status", "notes"]
+            reset_snapshot_on_filter_change(
+                ckey, (flagged_only, tb_c["search"], tb_c["sort"]))
+            # Snapshot the SAME column subset handed to the editor below -- snapshotting
+            # the full fetched frame here would make is_dirty() always report dirty
+            # (column-set mismatch always fails .equals()).
+            ensure_snapshot(ckey, df_c[readonly_cols + editable_cols])
 
-        mv = mergever(ckey)
-        edited_c = st.data_editor(
-            df_c[readonly_cols + editable_cols],
-            key=f"ed_{ckey}_{mv}",
-            use_container_width=True, num_rows="fixed", hide_index=True,
-            column_config={
-                "charter_pk": None,
-                "sequence": st.column_config.NumberColumn("Seq", width="small", disabled=True),
-                "di_reference": st.column_config.TextColumn("DI ref.", width="medium", disabled=True),
-                "Status": st.column_config.TextColumn("Status", width="medium", disabled=True),
-                "notes": st.column_config.TextColumn("Notes (diagnostic)", width="large", disabled=True),
-                "date": st.column_config.TextColumn("Date", width="small"),
-                "date_uncertain": st.column_config.TextColumn("Uncertain?", width="small"),
-                "doc_type": st.column_config.TextColumn("Doc type", width="small"),
-                "subject": st.column_config.TextColumn("Subject", width="medium"),
-                "outcome": st.column_config.TextColumn("Outcome", width="medium"),
-                "scribe": st.column_config.TextColumn("Scribe", width="small"),
-                "scribe_source": st.column_config.TextColumn("Scribe source", width="small"),
-                "seal_info": st.column_config.TextColumn("Seal info", width="small"),
-                "language": st.column_config.TextColumn("Language", width="small"),
-            },
-        )
+            mv = mergever(ckey)
+            edited_c = st.data_editor(
+                df_c[readonly_cols + editable_cols],
+                key=f"ed_{ckey}_{mv}",
+                use_container_width=True, num_rows="fixed", hide_index=True,
+                column_config={
+                    "charter_pk": None,
+                    "sequence": st.column_config.NumberColumn("Seq", width="small", disabled=True),
+                    "di_reference": st.column_config.TextColumn("DI ref.", width="medium", disabled=True),
+                    "Status": st.column_config.TextColumn("Status", width="medium", disabled=True),
+                    "notes": st.column_config.TextColumn("Notes (diagnostic)", width="large", disabled=True),
+                    "date": st.column_config.TextColumn("Date", width="small"),
+                    "date_uncertain": st.column_config.TextColumn("Uncertain?", width="small"),
+                    "doc_type": st.column_config.TextColumn("Doc type", width="small"),
+                    "subject": st.column_config.TextColumn("Subject", width="medium"),
+                    "outcome": st.column_config.TextColumn("Outcome", width="medium"),
+                    "scribe": st.column_config.TextColumn("Scribe", width="small"),
+                    "scribe_source": st.column_config.TextColumn("Scribe source", width="small"),
+                    "seal_info": st.column_config.TextColumn("Seal info", width="small"),
+                    "language": st.column_config.TextColumn("Language", width="small"),
+                },
+            )
 
-        def _apply_charters(edited_df):
-            def _update(pk, **changes):
-                row = df_c.loc[df_c["charter_pk"] == pk].iloc[0]
-                db.update_charter(int(row["volume"]), int(row["sequence"]), **changes)
-            return apply_row_diffs(st.session_state[snap_key(ckey)], edited_df, "charter_pk",
-                                    _update, editable_cols)
+            def _apply_charters(edited_df):
+                def _update(pk, **changes):
+                    row = df_c.loc[df_c["charter_pk"] == pk].iloc[0]
+                    db.update_charter(int(row["volume"]), int(row["sequence"]), **changes)
+                return apply_row_diffs(st.session_state[snap_key(ckey)], edited_df, "charter_pk",
+                                        _update, editable_cols)
 
-        dirty_c = is_dirty(ckey, edited_c)
-        save_button(ckey, edited_c, _apply_charters)
+            dirty_c = is_dirty(ckey, edited_c)
+            save_button(ckey, edited_c, _apply_charters)
 
-        st.markdown("---")
-        st.caption("Row actions for still-flagged charters:")
-        for _, row in df_c[df_c["Status"] != "OK"].iterrows():
-            with st.container(border=True):
-                st.markdown(f"**Seq {row['sequence']}** ({row['di_reference'] or 'no DI ref.'}) — {row['Status']}")
-                b1, b2 = st.columns(2)
-                with b1:
-                    if row["has_review_persons"] or row["has_review_places"]:
-                        st.caption("→ Resolve the remaining item(s) in the **Review Queue** tab.")
-                with b2:
-                    if row["has_parse_error"]:
-                        if st.button(f"Re-extract seq {row['sequence']}", key=f"reextract_{row['charter_pk']}"):
-                            run_command(
-                                [PYTHON, "02_extract_entities.py", "--vol", str(vn),
-                                 "--start", str(row["sequence"]), "--end", str(row["sequence"])],
-                                f"reextract_{row['charter_pk']}",
-                            )
-                            st.info("Re-extraction started — re-run Step 3 and Step 5 in the "
-                                    "Pipeline tab afterward to bring it into the database.")
+            st.markdown("---")
+            st.caption("Row actions for still-flagged charters:")
+            for _, row in df_c[df_c["Status"] != "OK"].iterrows():
+                with st.container(border=True):
+                    st.markdown(f"**Seq {row['sequence']}** ({row['di_reference'] or 'no DI ref.'}) — {row['Status']}")
+                    b1, b2 = st.columns(2)
+                    with b1:
+                        if row["has_review_persons"] or row["has_review_places"]:
+                            st.caption("→ Resolve the remaining item(s) in the **Review Queue** tab.")
+                    with b2:
+                        if row["has_parse_error"]:
+                            if st.button(f"Re-extract seq {row['sequence']}", key=f"reextract_{row['charter_pk']}"):
+                                run_command(
+                                    [PYTHON, "02_extract_entities.py", "--vol", str(vn),
+                                     "--start", str(row["sequence"]), "--end", str(row["sequence"])],
+                                    f"reextract_{row['charter_pk']}",
+                                )
+                                st.info("Re-extraction started — re-run Step 3 and Step 5 in the "
+                                        "Pipeline tab afterward to bring it into the database.")
 
 
 # ── tab: review queue ────────────────────────────────────────────────────────
@@ -789,84 +817,96 @@ with tab_queue:
 
     with sub_pending:
         qkey = f"{vol}_queue"
-        df_q = db.get_open_review_items(vn)
-        if df_q.empty:
+        df_q_all = db.get_open_review_items(vn)
+        if df_q_all.empty:
             st.info("No open review queue items for this volume.")
         else:
-            ensure_snapshot(qkey, df_q)
-            mv = mergever(qkey)
-            edited_q = st.data_editor(
-                with_checkbox(df_q, "select"),
-                key=f"ed_{qkey}_{mv}",
-                use_container_width=True, num_rows="fixed", hide_index=True,
-                column_order=["select", "review_item_pk", "entity_type", "extracted_name",
-                              "closest_match", "match_pk", "score", "role_category", "role", "decision"],
-                column_config={
-                    "select": st.column_config.CheckboxColumn("Select", width="small"),
-                    "review_item_pk": None,
-                    "charter_pk": None, "charter_person_pk": None, "charter_place_pk": None,
-                    "outcome_pk": None, "status": None, "resolved_at": None,
-                    "created_at": None, "charter_date": None, "charter_volume": None,
-                    "entity_type": st.column_config.TextColumn("Type", width="small", disabled=True),
-                    "extracted_name": st.column_config.TextColumn("Extracted name", width="medium", disabled=True),
-                    "closest_match": st.column_config.TextColumn("Closest match", width="medium", disabled=True),
-                    "match_pk": st.column_config.NumberColumn("Proposed pk", width="small", disabled=True),
-                    "score": st.column_config.NumberColumn("Score", format="%.1f", width="small", disabled=True),
-                    "role_category": st.column_config.TextColumn("Role", width="small", disabled=True),
-                    "role": st.column_config.TextColumn("Place role", width="small", disabled=True),
-                    "decision": st.column_config.SelectboxColumn(
-                        "Decision", options=["", "accept", "reject"], width="small",
-                        help="accept = use proposed pk  ·  reject = treat as new entity",
-                    ),
-                },
-            )
+            tb_q = ui_widgets.render_filter_toolbar(qkey, status_options=["", "accept", "reject"])
+            df_q = ui_widgets.filter_dataframe(
+                df_q_all, search=tb_q["search"],
+                search_cols=["extracted_name", "closest_match", "role_category", "role"],
+                status_col="decision", status=tb_q["status"])
+            if tb_q["sort"] == "name":
+                df_q = df_q.sort_values("extracted_name")
+            if df_q.empty:
+                st.info("No rows match this filter.")
+            else:
+                reset_snapshot_on_filter_change(qkey, (tb_q["status"], tb_q["search"], tb_q["sort"]))
+                ensure_snapshot(qkey, df_q)
+                mv = mergever(qkey)
+                edited_q = st.data_editor(
+                    with_checkbox(df_q, qkey, "review_item_pk"),
+                    key=f"ed_{qkey}_{mv}",
+                    use_container_width=True, num_rows="fixed", hide_index=True,
+                    column_order=["select", "review_item_pk", "entity_type", "extracted_name",
+                                  "closest_match", "match_pk", "score", "role_category", "role", "decision"],
+                    column_config={
+                        "select": st.column_config.CheckboxColumn("Select", width="small"),
+                        "review_item_pk": None,
+                        "charter_pk": None, "charter_person_pk": None, "charter_place_pk": None,
+                        "outcome_pk": None, "status": None, "resolved_at": None,
+                        "created_at": None, "charter_date": None, "charter_volume": None,
+                        "entity_type": st.column_config.TextColumn("Type", width="small", disabled=True),
+                        "extracted_name": st.column_config.TextColumn("Extracted name", width="medium", disabled=True),
+                        "closest_match": st.column_config.TextColumn("Closest match", width="medium", disabled=True),
+                        "match_pk": st.column_config.NumberColumn("Proposed pk", width="small", disabled=True),
+                        "score": st.column_config.NumberColumn("Score", format="%.1f", width="small", disabled=True),
+                        "role_category": st.column_config.TextColumn("Role", width="small", disabled=True),
+                        "role": st.column_config.TextColumn("Place role", width="small", disabled=True),
+                        "decision": st.column_config.SelectboxColumn(
+                            "Decision", options=["", "accept", "reject"], width="small",
+                            help="accept = use proposed pk  ·  reject = treat as new entity",
+                        ),
+                    },
+                )
+                sync_checked_pks(qkey, edited_q, "review_item_pk")
 
-            n_done = (edited_q["decision"].fillna("").str.strip() != "").sum()
-            st.caption(f"**{n_done} / {len(edited_q)}** decisions recorded")
+                n_done = (edited_q["decision"].fillna("").str.strip() != "").sum()
+                st.caption(f"**{n_done} / {len(edited_q)}** decisions recorded")
 
-            checked_idx = edited_q.index[edited_q["select"] == True].tolist()  # noqa: E712
-            col_pick, col_bulk, col_status = st.columns([1, 1, 4])
-            dirty_q = is_dirty(qkey, edited_q.drop(columns=["select"]))
-            with col_pick:
-                bulk_val = st.selectbox("Bulk decision", ["accept", "reject"],
-                                          key=f"bulkval_{qkey}", label_visibility="collapsed")
-            with col_bulk:
-                if st.button("Apply to selected", key=f"btn_bulk_{qkey}",
-                             disabled=dirty_q or len(checked_idx) < 2):
-                    for i in checked_idx:
-                        db.set_review_decision(int(edited_q.loc[i, "review_item_pk"]), bulk_val)
-                    bump(qkey)
-                    st.toast(f"Set decision='{bulk_val}' on {len(checked_idx)} row(s).")
+                checked_pks_q = edited_q.loc[edited_q["select"] == True, "review_item_pk"].tolist()  # noqa: E712
+                col_pick, col_bulk, col_status = st.columns([1, 1, 4])
+                dirty_q = is_dirty(qkey, edited_q.drop(columns=["select"]))
+                with col_pick:
+                    bulk_val = st.selectbox("Bulk decision", ["accept", "reject"],
+                                              key=f"bulkval_{qkey}", label_visibility="collapsed")
+                with col_bulk:
+                    if st.button("Apply to selected", key=f"btn_bulk_{qkey}",
+                                 disabled=dirty_q or len(checked_pks_q) < 2):
+                        for pk in checked_pks_q:
+                            db.set_review_decision(int(pk), bulk_val)
+                        bump(qkey)
+                        st.toast(f"Set decision='{bulk_val}' on {len(checked_pks_q)} row(s).")
+                        st.rerun()
+                with col_status:
+                    if dirty_q:
+                        st.caption("Save your pending changes below before bulk-applying.")
+                    elif len(checked_pks_q) >= 2:
+                        st.caption(f"{len(checked_pks_q)} rows checked.")
+
+                def _apply_queue(edited_df):
+                    # edited_df here is already the post-drop frame save_button()
+                    # was called with below -- dropping "select" again would KeyError.
+                    def _update(pk, **changes):
+                        db.set_review_decision(pk, changes["decision"])
+                    return apply_row_diffs(st.session_state[snap_key(qkey)],
+                                            edited_df, "review_item_pk", _update, ["decision"])
+                save_button(qkey, edited_q.drop(columns=["select"]), _apply_queue)
+
+                st.markdown("---")
+                if st.button("Resolve decided rows", key=f"btn_resolve_{qkey}", type="primary",
+                             disabled=dirty_q):
+                    accepted = rejected = 0
+                    for _, row in edited_q.iterrows():
+                        if (row["decision"] or "").strip().lower() in ("accept", "reject"):
+                            result = db.apply_review_decision(int(row["review_item_pk"]))
+                            if result.get("decision") == "accept":
+                                accepted += 1
+                            elif result.get("decision") == "reject":
+                                rejected += 1
+                    bump(qkey, f"{vol}_persons", f"{vol}_places")
+                    st.toast(f"Accepted {accepted}, rejected {rejected}.")
                     st.rerun()
-            with col_status:
-                if dirty_q:
-                    st.caption("Save your pending changes below before bulk-applying.")
-                elif len(checked_idx) >= 2:
-                    st.caption(f"{len(checked_idx)} rows checked.")
-
-            def _apply_queue(edited_df):
-                # edited_df here is already the post-drop frame save_button()
-                # was called with below -- dropping "select" again would KeyError.
-                def _update(pk, **changes):
-                    db.set_review_decision(pk, changes["decision"])
-                return apply_row_diffs(st.session_state[snap_key(qkey)],
-                                        edited_df, "review_item_pk", _update, ["decision"])
-            save_button(qkey, edited_q.drop(columns=["select"]), _apply_queue)
-
-            st.markdown("---")
-            if st.button("Resolve decided rows", key=f"btn_resolve_{qkey}", type="primary",
-                         disabled=dirty_q):
-                accepted = rejected = 0
-                for _, row in edited_q.iterrows():
-                    if (row["decision"] or "").strip().lower() in ("accept", "reject"):
-                        result = db.apply_review_decision(int(row["review_item_pk"]))
-                        if result.get("decision") == "accept":
-                            accepted += 1
-                        elif result.get("decision") == "reject":
-                            rejected += 1
-                bump(qkey, f"{vol}_persons", f"{vol}_places")
-                st.toast(f"Accepted {accepted}, rejected {rejected}.")
-                st.rerun()
 
     with sub_resolved:
         df_r = db.get_resolved_review_items(vn)
@@ -888,193 +928,202 @@ with tab_entities:
 
     with sub_p:
         pkey = f"{vol}_persons"
-        df_p = db.get_persons(status="provisional", source_volume=vn)
-        if df_p.empty:
+        st.caption("New-vs-authority comparison and ok/add/skip decisions now happen in the "
+                   "**Review** tab. This grid is for bulk field edits and merging duplicate rows.")
+        df_p_all = db.get_persons(status="provisional", source_volume=vn)
+        if df_p_all.empty:
             st.info("No new persons for this volume.")
         else:
-            df_p = blank_if_null(df_p, ["floruit_start", "floruit_end"])
-            ensure_snapshot(pkey, df_p)
-            mv = mergever(pkey)
+            tb_p = ui_widgets.render_filter_toolbar(pkey, status_options=["", "ok", "skip", "add"])
+            df_p = ui_widgets.filter_dataframe(
+                df_p_all, search=tb_p["search"],
+                search_cols=["canonical_name", "variant_names", "occupation", "title", "notes"],
+                status_col="review_status", status=tb_p["status"])
+            if tb_p["sort"] == "name":
+                df_p = df_p.sort_values("canonical_name")
+            if df_p.empty:
+                st.info("No rows match this filter.")
+            else:
+                reset_snapshot_on_filter_change(pkey, (tb_p["status"], tb_p["search"], tb_p["sort"]))
+                df_p = blank_if_null(df_p, ["floruit_start", "floruit_end"])
+                ensure_snapshot(pkey, df_p)
+                mv = mergever(pkey)
 
-            editable_p = ["review_status", "canonical_name", "wikidata_id", "variant_names",
-                          "patronymic", "occupation", "title", "floruit_start", "floruit_end",
-                          "gender", "associated_places", "notes"]
+                editable_p = ["review_status", "canonical_name", "wikidata_id", "variant_names",
+                              "patronymic", "occupation", "title", "floruit_start", "floruit_end",
+                              "gender", "associated_places", "notes"]
 
-            edited_p = st.data_editor(
-                with_checkbox(with_wikidata_links(df_p), "select"),
-                key=f"ed_{pkey}_{mv}",
-                use_container_width=True, num_rows="fixed", hide_index=True,
-                column_order=["select", "person_pk", "display_id", "review_status", "canonical_name",
-                              "wikidata_id", "wikidata_link", "variant_names", "patronymic",
-                              "occupation", "title", "floruit_start", "floruit_end", "gender",
-                              "associated_places", "notes", "sources"],
-                column_config={
-                    "select": st.column_config.CheckboxColumn(
-                        "Select", width="small",
-                        help="Check 1 row to compare it against the authority below. Check 2+ to merge them.",
-                    ),
-                    "person_pk": None,
-                    "display_id": st.column_config.TextColumn("ID", width="small", disabled=True),
-                    "review_status": st.column_config.SelectboxColumn(
-                        "Status", options=["", "ok", "skip", "add"], width="small"),
-                    "canonical_name": st.column_config.TextColumn("Canonical name", width="medium"),
-                    "wikidata_id": st.column_config.TextColumn("Wikidata ID", width="small"),
-                    "wikidata_link": st.column_config.LinkColumn("Wikidata", width="small", disabled=True),
-                    "variant_names": st.column_config.TextColumn("Variants", width="large"),
-                    "patronymic": st.column_config.TextColumn("Patronymic", width="small"),
-                    "occupation": st.column_config.TextColumn("Occupation", width="medium"),
-                    "title": st.column_config.TextColumn("Title", width="small"),
-                    "floruit_start": st.column_config.TextColumn("Fl. start", width="small"),
-                    "floruit_end": st.column_config.TextColumn("Fl. end", width="small"),
-                    "gender": st.column_config.SelectboxColumn("Gender", options=["", "M", "F", "unknown"], width="small"),
-                    "associated_places": st.column_config.TextColumn("Places", width="medium"),
-                    "notes": st.column_config.TextColumn("Notes", width="large"),
-                    "sources": st.column_config.TextColumn("Sources", width="small", disabled=True),
-                },
-            )
+                edited_p = st.data_editor(
+                    with_checkbox(with_wikidata_links(df_p), pkey, "person_pk"),
+                    key=f"ed_{pkey}_{mv}",
+                    use_container_width=True, num_rows="fixed", hide_index=True,
+                    column_order=["select", "person_pk", "display_id", "review_status", "canonical_name",
+                                  "wikidata_id", "wikidata_link", "variant_names", "patronymic",
+                                  "occupation", "title", "floruit_start", "floruit_end", "gender",
+                                  "associated_places", "notes", "sources"],
+                    column_config={
+                        "select": st.column_config.CheckboxColumn(
+                            "Select", width="small", help="Check 2+ rows to merge them."),
+                        "person_pk": None,
+                        "display_id": st.column_config.TextColumn("ID", width="small", disabled=True),
+                        "review_status": st.column_config.SelectboxColumn(
+                            "Status", options=["", "ok", "skip", "add"], width="small"),
+                        "canonical_name": st.column_config.TextColumn("Canonical name", width="medium"),
+                        "wikidata_id": st.column_config.TextColumn("Wikidata ID", width="small"),
+                        "wikidata_link": st.column_config.LinkColumn("Wikidata", width="small", disabled=True),
+                        "variant_names": st.column_config.TextColumn("Variants", width="large"),
+                        "patronymic": st.column_config.TextColumn("Patronymic", width="small"),
+                        "occupation": st.column_config.TextColumn("Occupation", width="medium"),
+                        "title": st.column_config.TextColumn("Title", width="small"),
+                        "floruit_start": st.column_config.TextColumn("Fl. start", width="small"),
+                        "floruit_end": st.column_config.TextColumn("Fl. end", width="small"),
+                        "gender": st.column_config.SelectboxColumn("Gender", options=["", "M", "F", "unknown"], width="small"),
+                        "associated_places": st.column_config.TextColumn("Places", width="medium"),
+                        "notes": st.column_config.TextColumn("Notes", width="large"),
+                        "sources": st.column_config.TextColumn("Sources", width="small", disabled=True),
+                    },
+                )
+                sync_checked_pks(pkey, edited_p, "person_pk")
 
-            counts = edited_p["review_status"].fillna("").value_counts()
-            st.caption(f"ok: {counts.get('ok', 0)} · skip: {counts.get('skip', 0)} · "
-                       f"add: {counts.get('add', 0)} · blank: {counts.get('', 0)} "
-                       "— blank behaves like **ok** at export time.")
+                counts = edited_p["review_status"].fillna("").value_counts()
+                st.caption(f"ok: {counts.get('ok', 0)} · skip: {counts.get('skip', 0)} · "
+                           f"add: {counts.get('add', 0)} · blank: {counts.get('', 0)} "
+                           "— blank behaves like **ok** at export time.")
 
-            checked_p = edited_p.loc[edited_p["select"] == True, "person_pk"].tolist()  # noqa: E712
-            dirty_p = is_dirty(pkey, edited_p.drop(columns=["select", "wikidata_link"]))
+                checked_p = edited_p.loc[edited_p["select"] == True, "person_pk"].tolist()  # noqa: E712
+                dirty_p = is_dirty(pkey, edited_p.drop(columns=["select", "wikidata_link"]))
 
-            c1, c2 = st.columns([1, 4])
-            with c1:
-                if st.button("Merge selected", key="btn_merge_p",
-                             disabled=dirty_p or len(checked_p) < 2):
-                    survivor = min(checked_p)
-                    dropped = [pk for pk in checked_p if pk != survivor]
-                    result = db.merge_persons(survivor, dropped)
-                    bump(pkey)
-                    st.toast(f"Merged {len(dropped)} row(s) into person_pk={survivor}.")
-                    st.rerun()
-            with c2:
-                if dirty_p:
-                    st.caption("Save pending changes before comparing/merging.")
-                elif len(checked_p) == 1:
-                    st.caption("Comparing the checked row against the authority below. "
-                               "Check a 2nd row instead to merge them.")
-                elif len(checked_p) >= 2:
-                    st.caption(f"{len(checked_p)} rows selected — will merge into the lowest pk.")
+                c1, c2 = st.columns([1, 4])
+                with c1:
+                    if st.button("Merge selected", key="btn_merge_p",
+                                 disabled=dirty_p or len(checked_p) < 2):
+                        survivor = min(checked_p)
+                        dropped = [pk for pk in checked_p if pk != survivor]
+                        result = db.merge_persons(survivor, dropped)
+                        bump(pkey)
+                        st.toast(f"Merged {len(dropped)} row(s) into person_pk={survivor}.")
+                        st.rerun()
+                with c2:
+                    if dirty_p:
+                        st.caption("Save pending changes before merging.")
+                    elif len(checked_p) >= 2:
+                        st.caption(f"{len(checked_p)} rows selected — will merge into the lowest pk.")
 
-            if len(checked_p) == 1 and not dirty_p:
-                with st.container(border=True):
-                    st.caption("Compare with authority")
-                    render_compare_from_lookup("person", checked_p[0], key_suffix="_p")
-
-            def _apply_persons(edited_df):
-                # edited_df is already the post-drop frame save_button() was
-                # called with below -- dropping select/wikidata_link again
-                # would KeyError since they're already gone.
-                def _update(pk, **changes):
-                    if "floruit_start" in changes:
-                        changes["floruit_start"] = db.to_int_or_none(changes["floruit_start"])
-                    if "floruit_end" in changes:
-                        changes["floruit_end"] = db.to_int_or_none(changes["floruit_end"])
-                    db.update_person(pk, **changes)
-                return apply_row_diffs(st.session_state[snap_key(pkey)],
-                                        edited_df, "person_pk", _update, editable_p)
-            save_button(pkey, edited_p.drop(columns=["select", "wikidata_link"]), _apply_persons)
+                def _apply_persons(edited_df):
+                    # edited_df is already the post-drop frame save_button() was
+                    # called with below -- dropping select/wikidata_link again
+                    # would KeyError since they're already gone.
+                    def _update(pk, **changes):
+                        if "floruit_start" in changes:
+                            changes["floruit_start"] = db.to_int_or_none(changes["floruit_start"])
+                        if "floruit_end" in changes:
+                            changes["floruit_end"] = db.to_int_or_none(changes["floruit_end"])
+                        db.update_person(pk, **changes)
+                    return apply_row_diffs(st.session_state[snap_key(pkey)],
+                                            edited_df, "person_pk", _update, editable_p)
+                save_button(pkey, edited_p.drop(columns=["select", "wikidata_link"]), _apply_persons)
 
     with sub_pl:
         plkey = f"{vol}_places"
-        df_pl = db.get_places(status="provisional", source_volume=vn)
-        if df_pl.empty:
+        st.caption("New-vs-authority comparison and ok/add/skip/no_match decisions now happen "
+                   "in the **Review** tab. This grid is for bulk field edits and merging duplicate rows.")
+        df_pl_all = db.get_places(status="provisional", source_volume=vn)
+        if df_pl_all.empty:
             st.info("No new places for this volume.")
         else:
-            df_pl = blank_if_null(df_pl, ["coordinates_lat", "coordinates_long", "geo_match_score"])
-            ensure_snapshot(plkey, df_pl)
-            mv = mergever(plkey)
+            tb_pl = ui_widgets.render_filter_toolbar(plkey, status_options=["", "ok", "skip", "add", "no_match"])
+            df_pl = ui_widgets.filter_dataframe(
+                df_pl_all, search=tb_pl["search"],
+                search_cols=["canonical_name", "variant_names", "region", "notes"],
+                status_col="review_status", status=tb_pl["status"])
+            if tb_pl["sort"] == "name":
+                df_pl = df_pl.sort_values("canonical_name")
+            if df_pl.empty:
+                st.info("No rows match this filter.")
+            else:
+                reset_snapshot_on_filter_change(plkey, (tb_pl["status"], tb_pl["search"], tb_pl["sort"]))
+                df_pl = blank_if_null(df_pl, ["coordinates_lat", "coordinates_long", "geo_match_score"])
+                ensure_snapshot(plkey, df_pl)
+                mv = mergever(plkey)
 
-            editable_pl = ["review_status", "canonical_name", "wikidata_id", "nafnid_id",
-                           "variant_names", "place_type", "coordinates_lat", "coordinates_long",
-                           "region", "district", "modern_equivalent", "notes"]
+                editable_pl = ["review_status", "canonical_name", "wikidata_id", "nafnid_id",
+                               "variant_names", "place_type", "coordinates_lat", "coordinates_long",
+                               "region", "district", "modern_equivalent", "notes"]
 
-            edited_pl = st.data_editor(
-                with_checkbox(with_wikidata_links(df_pl), "select"),
-                key=f"ed_{plkey}_{mv}",
-                use_container_width=True, num_rows="fixed", hide_index=True,
-                column_order=["select", "place_pk", "display_id", "review_status", "canonical_name",
-                              "wikidata_id", "wikidata_link", "nafnid_id", "variant_names", "place_type",
-                              "coordinates_lat", "coordinates_long", "region", "district",
-                              "modern_equivalent", "notes", "sources"],
-                column_config={
-                    "select": st.column_config.CheckboxColumn(
-                        "Select", width="small",
-                        help="Check 1 row to compare it against the authority below. Check 2+ to merge them."),
-                    "place_pk": None,
-                    "display_id": st.column_config.TextColumn("ID", width="small", disabled=True),
-                    "review_status": st.column_config.SelectboxColumn(
-                        "Status", options=["", "ok", "skip", "add", "no_match"], width="small"),
-                    "canonical_name": st.column_config.TextColumn("Canonical name", width="medium"),
-                    "wikidata_id": st.column_config.TextColumn("Wikidata ID", width="small"),
-                    "wikidata_link": st.column_config.LinkColumn("Wikidata", width="small", disabled=True),
-                    "nafnid_id": st.column_config.TextColumn("nafnid ID", width="small"),
-                    "variant_names": st.column_config.TextColumn("Variants", width="large"),
-                    "place_type": st.column_config.TextColumn("Type", width="small"),
-                    "coordinates_lat": st.column_config.TextColumn("Lat", width="small"),
-                    "coordinates_long": st.column_config.TextColumn("Lon", width="small"),
-                    "region": st.column_config.TextColumn("Region", width="small"),
-                    "district": st.column_config.TextColumn("District", width="small"),
-                    "modern_equivalent": st.column_config.TextColumn("Modern equiv.", width="medium"),
-                    "notes": st.column_config.TextColumn("Notes", width="large"),
-                    "sources": st.column_config.TextColumn("Sources", width="small", disabled=True),
-                },
-            )
+                edited_pl = st.data_editor(
+                    with_checkbox(with_wikidata_links(df_pl), plkey, "place_pk"),
+                    key=f"ed_{plkey}_{mv}",
+                    use_container_width=True, num_rows="fixed", hide_index=True,
+                    column_order=["select", "place_pk", "display_id", "review_status", "canonical_name",
+                                  "wikidata_id", "wikidata_link", "nafnid_id", "variant_names", "place_type",
+                                  "coordinates_lat", "coordinates_long", "region", "district",
+                                  "modern_equivalent", "notes", "sources"],
+                    column_config={
+                        "select": st.column_config.CheckboxColumn(
+                            "Select", width="small", help="Check 2+ rows to merge them."),
+                        "place_pk": None,
+                        "display_id": st.column_config.TextColumn("ID", width="small", disabled=True),
+                        "review_status": st.column_config.SelectboxColumn(
+                            "Status", options=["", "ok", "skip", "add", "no_match"], width="small"),
+                        "canonical_name": st.column_config.TextColumn("Canonical name", width="medium"),
+                        "wikidata_id": st.column_config.TextColumn("Wikidata ID", width="small"),
+                        "wikidata_link": st.column_config.LinkColumn("Wikidata", width="small", disabled=True),
+                        "nafnid_id": st.column_config.TextColumn("nafnid ID", width="small"),
+                        "variant_names": st.column_config.TextColumn("Variants", width="large"),
+                        "place_type": st.column_config.TextColumn("Type", width="small"),
+                        "coordinates_lat": st.column_config.TextColumn("Lat", width="small"),
+                        "coordinates_long": st.column_config.TextColumn("Lon", width="small"),
+                        "region": st.column_config.TextColumn("Region", width="small"),
+                        "district": st.column_config.TextColumn("District", width="small"),
+                        "modern_equivalent": st.column_config.TextColumn("Modern equiv.", width="medium"),
+                        "notes": st.column_config.TextColumn("Notes", width="large"),
+                        "sources": st.column_config.TextColumn("Sources", width="small", disabled=True),
+                    },
+                )
+                sync_checked_pks(plkey, edited_pl, "place_pk")
 
-            counts_pl = edited_pl["review_status"].fillna("").value_counts()
-            st.caption(f"ok: {counts_pl.get('ok', 0)} · skip: {counts_pl.get('skip', 0)} · "
-                       f"add: {counts_pl.get('add', 0)} · blank: {counts_pl.get('', 0)} "
-                       "— blank behaves like **ok** at export time.")
+                counts_pl = edited_pl["review_status"].fillna("").value_counts()
+                st.caption(f"ok: {counts_pl.get('ok', 0)} · skip: {counts_pl.get('skip', 0)} · "
+                           f"add: {counts_pl.get('add', 0)} · blank: {counts_pl.get('', 0)} "
+                           "— blank behaves like **ok** at export time.")
 
-            checked_pl = edited_pl.loc[edited_pl["select"] == True, "place_pk"].tolist()  # noqa: E712
-            dirty_pl = is_dirty(plkey, edited_pl.drop(columns=["select", "wikidata_link"]))
+                checked_pl = edited_pl.loc[edited_pl["select"] == True, "place_pk"].tolist()  # noqa: E712
+                dirty_pl = is_dirty(plkey, edited_pl.drop(columns=["select", "wikidata_link"]))
 
-            c1, c2 = st.columns([1, 4])
-            with c1:
-                if st.button("Merge selected", key="btn_merge_pl",
-                             disabled=dirty_pl or len(checked_pl) < 2):
-                    survivor = min(checked_pl)
-                    dropped = [pk for pk in checked_pl if pk != survivor]
-                    result = db.merge_places(survivor, dropped)
-                    bump(plkey)
-                    st.toast(f"Merged {len(dropped)} row(s) into place_pk={survivor}.")
-                    st.rerun()
-            with c2:
-                if dirty_pl:
-                    st.caption("Save pending changes before comparing/merging.")
-                elif len(checked_pl) == 1:
-                    st.caption("Comparing the checked row against the authority below. "
-                               "Check a 2nd row instead to merge them.")
-                elif len(checked_pl) >= 2:
-                    st.caption(f"{len(checked_pl)} rows selected — will merge into the lowest pk.")
+                c1, c2 = st.columns([1, 4])
+                with c1:
+                    if st.button("Merge selected", key="btn_merge_pl",
+                                 disabled=dirty_pl or len(checked_pl) < 2):
+                        survivor = min(checked_pl)
+                        dropped = [pk for pk in checked_pl if pk != survivor]
+                        result = db.merge_places(survivor, dropped)
+                        bump(plkey)
+                        st.toast(f"Merged {len(dropped)} row(s) into place_pk={survivor}.")
+                        st.rerun()
+                with c2:
+                    if dirty_pl:
+                        st.caption("Save pending changes before merging.")
+                    elif len(checked_pl) >= 2:
+                        st.caption(f"{len(checked_pl)} rows selected — will merge into the lowest pk.")
 
-            if len(checked_pl) == 1 and not dirty_pl:
-                with st.container(border=True):
-                    st.caption("Compare with authority")
-                    render_compare_from_lookup("place", checked_pl[0], key_suffix="_pl")
-
-            def _apply_places(edited_df):
-                # edited_df is already the post-drop frame save_button() was
-                # called with below -- dropping select/wikidata_link again
-                # would KeyError since they're already gone.
-                def _update(pk, **changes):
-                    for f in ("coordinates_lat", "coordinates_long"):
-                        if f in changes:
-                            try:
-                                changes[f] = float(changes[f]) if str(changes[f]).strip() else None
-                            except ValueError:
-                                changes[f] = None
-                    name_changed = "canonical_name" in changes or "variant_names" in changes
-                    db.update_place(pk, **changes)
-                    if name_changed:
-                        db.reconcile_place_wikidata(pk)
-                return apply_row_diffs(st.session_state[snap_key(plkey)],
-                                        edited_df, "place_pk", _update, editable_pl)
-            save_button(plkey, edited_pl.drop(columns=["select", "wikidata_link"]), _apply_places)
+                def _apply_places(edited_df):
+                    # edited_df is already the post-drop frame save_button() was
+                    # called with below -- dropping select/wikidata_link again
+                    # would KeyError since they're already gone.
+                    def _update(pk, **changes):
+                        for f in ("coordinates_lat", "coordinates_long"):
+                            if f in changes:
+                                try:
+                                    changes[f] = float(changes[f]) if str(changes[f]).strip() else None
+                                except ValueError:
+                                    changes[f] = None
+                        name_changed = "canonical_name" in changes or "variant_names" in changes
+                        db.update_place(pk, **changes)
+                        if name_changed:
+                            db.reconcile_place_wikidata(pk)
+                    return apply_row_diffs(st.session_state[snap_key(plkey)],
+                                            edited_df, "place_pk", _update, editable_pl)
+                save_button(plkey, edited_pl.drop(columns=["select", "wikidata_link"]), _apply_places)
 
 
 # ── tab: person duplicates ─────────────────────────────────────────────────
@@ -1101,83 +1150,101 @@ with tab_dupes:
             st.rerun()
 
     render_duplicate_finder_control()
+    st.caption("Comparing candidates one at a time, with a character-level diff, now also "
+               "happens in the **Review** tab. This grid is for bulk browsing/filtering.")
 
     dkey = "person_dupes"
-    df_dupes = db.get_person_duplicate_candidates()
-    if df_dupes.empty:
+    df_dupes_all = db.get_person_duplicate_candidates()
+    if df_dupes_all.empty:
         st.info("No duplicate candidates on file yet. Click **Run duplicate finder** above.")
     else:
-        ensure_snapshot(dkey, df_dupes)
-        mv = mergever(dkey)
-        edited_dupes = st.data_editor(
-            with_checkbox(df_dupes, "select"),
-            key=f"ed_{dkey}_{mv}",
-            use_container_width=True, num_rows="fixed", hide_index=True,
-            column_order=["select", "a_display_id", "a_canonical_name", "a_source", "a_floruit_start",
-                          "a_floruit_end", "a_occupation", "a_title", "b_display_id", "b_canonical_name",
-                          "b_source", "b_floruit_start", "b_floruit_end", "b_occupation", "b_title",
-                          "name_score", "date_status", "classification", "confidence", "decision"],
-            column_config={
-                "select": st.column_config.CheckboxColumn("Select", width="small"),
-                "candidate_pk": None, "person_a_pk": None, "person_b_pk": None, "decided_at": None, "created_at": None,
-                "a_display_id": st.column_config.TextColumn("A · ID", width="small", disabled=True),
-                "a_canonical_name": st.column_config.TextColumn("A · Name", width="medium", disabled=True),
-                "a_source": st.column_config.TextColumn("A · Source", width="small", disabled=True),
-                "a_floruit_start": st.column_config.NumberColumn("A · Fl. start", width="small", disabled=True),
-                "a_floruit_end": st.column_config.NumberColumn("A · Fl. end", width="small", disabled=True),
-                "a_occupation": st.column_config.TextColumn("A · Occupation", width="medium", disabled=True),
-                "a_title": st.column_config.TextColumn("A · Title", width="medium", disabled=True),
-                "b_display_id": st.column_config.TextColumn("B · ID", width="small", disabled=True),
-                "b_canonical_name": st.column_config.TextColumn("B · Name", width="medium", disabled=True),
-                "b_source": st.column_config.TextColumn("B · Source", width="small", disabled=True),
-                "b_floruit_start": st.column_config.NumberColumn("B · Fl. start", width="small", disabled=True),
-                "b_floruit_end": st.column_config.NumberColumn("B · Fl. end", width="small", disabled=True),
-                "b_occupation": st.column_config.TextColumn("B · Occupation", width="medium", disabled=True),
-                "b_title": st.column_config.TextColumn("B · Title", width="medium", disabled=True),
-                "name_score": st.column_config.NumberColumn("Name score", format="%.0f", width="small", disabled=True),
-                "date_status": st.column_config.TextColumn("Dates", width="small", disabled=True),
-                "classification": st.column_config.TextColumn("Classification", width="medium", disabled=True),
-                "confidence": st.column_config.TextColumn("Confidence", width="small", disabled=True),
-                "decision": st.column_config.SelectboxColumn(
-                    "Decision", options=["", "same", "different"], width="small"),
-            },
-        )
+        tb_d = ui_widgets.render_filter_toolbar(
+            dkey, status_options=["", "same", "different"], sort_options=ui_widgets.SCORE_SORT_OPTIONS)
+        df_dupes = ui_widgets.filter_dataframe(
+            df_dupes_all, search=tb_d["search"], status_col="decision", status=tb_d["status"])
+        if tb_d["sort"] == "score_desc":
+            df_dupes = df_dupes.sort_values("name_score", ascending=False)
+        elif tb_d["sort"] == "score_asc":
+            df_dupes = df_dupes.sort_values("name_score", ascending=True)
+        elif tb_d["sort"] == "name":
+            df_dupes = df_dupes.sort_values("a_canonical_name")
 
-        n_done = (edited_dupes["decision"].fillna("").str.strip() != "").sum()
-        st.caption(f"**{n_done} / {len(edited_dupes)}** decisions recorded — sorted highest-confidence first")
+        if df_dupes.empty:
+            st.info("No rows match this filter.")
+        else:
+            reset_snapshot_on_filter_change(dkey, (tb_d["status"], tb_d["search"], tb_d["sort"]))
+            ensure_snapshot(dkey, df_dupes)
+            mv = mergever(dkey)
+            edited_dupes = st.data_editor(
+                with_checkbox(df_dupes, dkey, "candidate_pk"),
+                key=f"ed_{dkey}_{mv}",
+                use_container_width=True, num_rows="fixed", hide_index=True,
+                column_order=["select", "a_display_id", "a_canonical_name", "a_source", "a_floruit_start",
+                              "a_floruit_end", "a_occupation", "a_title", "b_display_id", "b_canonical_name",
+                              "b_source", "b_floruit_start", "b_floruit_end", "b_occupation", "b_title",
+                              "name_score", "date_status", "classification", "confidence", "decision"],
+                column_config={
+                    "select": st.column_config.CheckboxColumn("Select", width="small"),
+                    "candidate_pk": None, "person_a_pk": None, "person_b_pk": None, "decided_at": None, "created_at": None,
+                    "a_display_id": st.column_config.TextColumn("A · ID", width="small", disabled=True),
+                    "a_canonical_name": st.column_config.TextColumn("A · Name", width="medium", disabled=True),
+                    "a_source": st.column_config.TextColumn("A · Source", width="small", disabled=True),
+                    "a_floruit_start": st.column_config.NumberColumn("A · Fl. start", width="small", disabled=True),
+                    "a_floruit_end": st.column_config.NumberColumn("A · Fl. end", width="small", disabled=True),
+                    "a_occupation": st.column_config.TextColumn("A · Occupation", width="medium", disabled=True),
+                    "a_title": st.column_config.TextColumn("A · Title", width="medium", disabled=True),
+                    "b_display_id": st.column_config.TextColumn("B · ID", width="small", disabled=True),
+                    "b_canonical_name": st.column_config.TextColumn("B · Name", width="medium", disabled=True),
+                    "b_source": st.column_config.TextColumn("B · Source", width="small", disabled=True),
+                    "b_floruit_start": st.column_config.NumberColumn("B · Fl. start", width="small", disabled=True),
+                    "b_floruit_end": st.column_config.NumberColumn("B · Fl. end", width="small", disabled=True),
+                    "b_occupation": st.column_config.TextColumn("B · Occupation", width="medium", disabled=True),
+                    "b_title": st.column_config.TextColumn("B · Title", width="medium", disabled=True),
+                    "name_score": st.column_config.NumberColumn("Name score", format="%.0f", width="small", disabled=True),
+                    "date_status": st.column_config.TextColumn("Dates", width="small", disabled=True),
+                    "classification": st.column_config.TextColumn("Classification", width="medium", disabled=True),
+                    "confidence": st.column_config.TextColumn("Confidence", width="small", disabled=True),
+                    "decision": st.column_config.SelectboxColumn(
+                        "Decision", options=["", "same", "different"], width="small"),
+                },
+            )
+            sync_checked_pks(dkey, edited_dupes, "candidate_pk")
 
-        def _apply_dupes(edited_df):
-            # edited_df is already the post-drop frame save_button() was
-            # called with below -- dropping "select" again would KeyError.
-            def _update(pk, **changes):
-                db.record_person_duplicate_decision(pk, changes["decision"])
-            return apply_row_diffs(st.session_state[snap_key(dkey)],
-                                    edited_df, "candidate_pk", _update, ["decision"])
-        dirty_d = is_dirty(dkey, edited_dupes.drop(columns=["select"]))
-        save_button(dkey, edited_dupes.drop(columns=["select"]), _apply_dupes)
+            n_done = (edited_dupes["decision"].fillna("").str.strip() != "").sum()
+            st.caption(f"**{n_done} / {len(edited_dupes)}** decisions recorded — sorted highest-confidence first")
 
-        checked_d = edited_dupes[edited_dupes["select"] == True]  # noqa: E712
-        st.markdown("---")
-        col_send, col_status = st.columns([1, 5])
-        with col_send:
-            if st.button("Send to Final Review", key="btn_send_final", disabled=dirty_d or checked_d.empty):
-                sent = skipped_not_different = 0
-                for _, row in checked_d.iterrows():
-                    if (row["decision"] or "").strip().lower() != "different":
-                        skipped_not_different += 1
-                        continue
-                    for pk in (row["person_a_pk"], row["person_b_pk"]):
-                        p = db.get_person_by_pk(int(pk))
-                        if p and p["status"] == "provisional":
-                            db.update_person(int(pk), review_status="add")
-                            sent += 1
-                st.toast(f"Marked {sent} person(s) review_status=add. "
-                         f"Skipped {skipped_not_different} not yet 'different'.")
-                st.rerun()
-        with col_status:
-            if not checked_d.empty:
-                st.caption(f"{len(checked_d)} row(s) checked — only rows marked "
-                           "**different** are sent; provisional sides get review_status=add.")
+            def _apply_dupes(edited_df):
+                # edited_df is already the post-drop frame save_button() was
+                # called with below -- dropping "select" again would KeyError.
+                def _update(pk, **changes):
+                    db.record_person_duplicate_decision(pk, changes["decision"])
+                return apply_row_diffs(st.session_state[snap_key(dkey)],
+                                        edited_df, "candidate_pk", _update, ["decision"])
+            dirty_d = is_dirty(dkey, edited_dupes.drop(columns=["select"]))
+            save_button(dkey, edited_dupes.drop(columns=["select"]), _apply_dupes)
+
+            checked_d = edited_dupes[edited_dupes["select"] == True]  # noqa: E712
+            st.markdown("---")
+            col_send, col_status = st.columns([1, 5])
+            with col_send:
+                if st.button("Send to Final Review", key="btn_send_final", disabled=dirty_d or checked_d.empty):
+                    sent = skipped_not_different = 0
+                    for _, row in checked_d.iterrows():
+                        if (row["decision"] or "").strip().lower() != "different":
+                            skipped_not_different += 1
+                            continue
+                        for pk in (row["person_a_pk"], row["person_b_pk"]):
+                            p = db.get_person_by_pk(int(pk))
+                            if p and p["status"] == "provisional":
+                                db.update_person(int(pk), review_status="add")
+                                sent += 1
+                    st.toast(f"Marked {sent} person(s) review_status=add. "
+                             f"Skipped {skipped_not_different} not yet 'different'.")
+                    st.rerun()
+            with col_status:
+                if not checked_d.empty:
+                    st.caption(f"{len(checked_d)} row(s) checked — only rows marked "
+                               "**different** are sent; provisional sides get review_status=add.")
 
 
 # ── tab: place duplicates ────────────────────────────────────────────────────
@@ -1186,57 +1253,77 @@ with tab_place_dupes:
     undo_widget("place_dupes")
     st.caption(
         "Candidates from nafnid.is (Árnastofnun) reconciliation (Step 4a). No confirmed-'same' "
-        "signal exists yet, so these are always warnings in Final Review, never a hard block."
+        "signal exists yet, so these are always warnings in Final Review, never a hard block. "
+        "Comparing one at a time now also happens in the **Review** tab."
     )
-    include_all = st.checkbox("Include all volumes", value=False, key="pd_include_all")
 
-    pdkey = "place_dupes" if include_all else f"{vol}_place_dupes"
-    df_pdupes = db.get_place_duplicate_candidates(volume=None if include_all else vn)
-    if df_pdupes.empty:
+    pdkey = "place_dupes"
+    df_pdupes_all = db.get_place_duplicate_candidates(volume=None)
+    if df_pdupes_all.empty:
         st.info("No place duplicate candidates on file. Run Step 4a in the Pipeline tab.")
     else:
-        ensure_snapshot(pdkey, df_pdupes)
-        mv = mergever(pdkey)
-        edited_pdupes = st.data_editor(
-            with_checkbox(df_pdupes, "select"),
-            key=f"ed_{pdkey}_{mv}",
-            use_container_width=True, num_rows="fixed", hide_index=True,
-            column_order=["select", "display_id", "place_canonical_name", "source_volume", "di_name",
-                          "candidate_name", "candidate_rank", "name_score", "distance_km", "flag",
-                          "match_sources", "candidate_sysla", "decision"],
-            column_config={
-                "select": st.column_config.CheckboxColumn("Select", width="small"),
-                "candidate_pk": None, "place_pk": None, "di_sysla_given": None, "di_place_type": None,
-                "di_region": None, "wikidata_status": None, "candidate_nafnid": None,
-                "candidate_hreppur": None, "candidate_lat": None, "candidate_lng": None, "created_at": None,
-                "display_id": st.column_config.TextColumn("Place ID", width="small", disabled=True),
-                "place_canonical_name": st.column_config.TextColumn("DI place", width="medium", disabled=True),
-                "source_volume": st.column_config.NumberColumn("Vol", width="small", disabled=True),
-                "di_name": st.column_config.TextColumn("DI name", width="medium", disabled=True),
-                "candidate_name": st.column_config.TextColumn("nafnid candidate", width="medium", disabled=True),
-                "candidate_rank": st.column_config.NumberColumn("Rank", width="small", disabled=True),
-                "name_score": st.column_config.NumberColumn("Name score", format="%.1f", width="small", disabled=True),
-                "distance_km": st.column_config.NumberColumn("Dist. (km)", format="%.1f", width="small", disabled=True),
-                "flag": st.column_config.TextColumn("Flag", width="small", disabled=True),
-                "match_sources": st.column_config.TextColumn("Sources", width="small", disabled=True),
-                "candidate_sysla": st.column_config.TextColumn("Sýsla", width="small", disabled=True),
-                "decision": st.column_config.SelectboxColumn(
-                    "Decision", options=["", "same", "different"], width="small",
-                    help="same = confirmed match, backfills nafnid_id  ·  different = false positive"),
-            },
-        )
+        tb_pd = ui_widgets.render_filter_toolbar(
+            pdkey, volumes=volumes, status_options=["", "same", "different"],
+            sort_options=ui_widgets.SCORE_SORT_OPTIONS)
+        df_pdupes = ui_widgets.filter_dataframe(
+            df_pdupes_all, search=tb_pd["search"], status_col="decision", status=tb_pd["status"])
+        if tb_pd["volumes"]:
+            df_pdupes = df_pdupes[df_pdupes["source_volume"].isin(tb_pd["volumes"])]
+        if tb_pd["sort"] == "score_desc":
+            df_pdupes = df_pdupes.sort_values("name_score", ascending=False)
+        elif tb_pd["sort"] == "score_asc":
+            df_pdupes = df_pdupes.sort_values("name_score", ascending=True)
+        elif tb_pd["sort"] == "name":
+            df_pdupes = df_pdupes.sort_values("place_canonical_name")
 
-        n_done = (edited_pdupes["decision"].fillna("").str.strip() != "").sum()
-        st.caption(f"**{n_done} / {len(edited_pdupes)}** decisions recorded — sorted highest-confidence first")
+        if df_pdupes.empty:
+            st.info("No rows match this filter.")
+        else:
+            reset_snapshot_on_filter_change(
+                pdkey, (tuple(sorted(tb_pd["volumes"] or [])), tb_pd["status"], tb_pd["search"], tb_pd["sort"]))
+            ensure_snapshot(pdkey, df_pdupes)
+            mv = mergever(pdkey)
+            edited_pdupes = st.data_editor(
+                with_checkbox(df_pdupes, pdkey, "candidate_pk"),
+                key=f"ed_{pdkey}_{mv}",
+                use_container_width=True, num_rows="fixed", hide_index=True,
+                column_order=["select", "display_id", "place_canonical_name", "source_volume", "di_name",
+                              "candidate_name", "candidate_rank", "name_score", "distance_km", "flag",
+                              "match_sources", "candidate_sysla", "decision"],
+                column_config={
+                    "select": st.column_config.CheckboxColumn("Select", width="small"),
+                    "candidate_pk": None, "place_pk": None, "di_sysla_given": None, "di_place_type": None,
+                    "di_region": None, "wikidata_status": None, "candidate_nafnid": None,
+                    "candidate_hreppur": None, "candidate_lat": None, "candidate_lng": None, "created_at": None,
+                    "display_id": st.column_config.TextColumn("Place ID", width="small", disabled=True),
+                    "place_canonical_name": st.column_config.TextColumn("DI place", width="medium", disabled=True),
+                    "source_volume": st.column_config.NumberColumn("Vol", width="small", disabled=True),
+                    "di_name": st.column_config.TextColumn("DI name", width="medium", disabled=True),
+                    "candidate_name": st.column_config.TextColumn("nafnid candidate", width="medium", disabled=True),
+                    "candidate_rank": st.column_config.NumberColumn("Rank", width="small", disabled=True),
+                    "name_score": st.column_config.NumberColumn("Name score", format="%.1f", width="small", disabled=True),
+                    "distance_km": st.column_config.NumberColumn("Dist. (km)", format="%.1f", width="small", disabled=True),
+                    "flag": st.column_config.TextColumn("Flag", width="small", disabled=True),
+                    "match_sources": st.column_config.TextColumn("Sources", width="small", disabled=True),
+                    "candidate_sysla": st.column_config.TextColumn("Sýsla", width="small", disabled=True),
+                    "decision": st.column_config.SelectboxColumn(
+                        "Decision", options=["", "same", "different"], width="small",
+                        help="same = confirmed match, backfills nafnid_id  ·  different = false positive"),
+                },
+            )
+            sync_checked_pks(pdkey, edited_pdupes, "candidate_pk")
 
-        def _apply_pdupes(edited_df):
-            # edited_df is already the post-drop frame save_button() was
-            # called with below -- dropping "select" again would KeyError.
-            def _update(pk, **changes):
-                db.record_place_duplicate_decision(pk, changes["decision"])
-            return apply_row_diffs(st.session_state[snap_key(pdkey)],
-                                    edited_df, "candidate_pk", _update, ["decision"])
-        save_button(pdkey, edited_pdupes.drop(columns=["select"]), _apply_pdupes)
+            n_done = (edited_pdupes["decision"].fillna("").str.strip() != "").sum()
+            st.caption(f"**{n_done} / {len(edited_pdupes)}** decisions recorded — sorted highest-confidence first")
+
+            def _apply_pdupes(edited_df):
+                # edited_df is already the post-drop frame save_button() was
+                # called with below -- dropping "select" again would KeyError.
+                def _update(pk, **changes):
+                    db.record_place_duplicate_decision(pk, changes["decision"])
+                return apply_row_diffs(st.session_state[snap_key(pdkey)],
+                                        edited_df, "candidate_pk", _update, ["decision"])
+            save_button(pdkey, edited_pdupes.drop(columns=["select"]), _apply_pdupes)
 
 
 # ── tab: final review ────────────────────────────────────────────────────────
@@ -1272,14 +1359,8 @@ with tab_final:
                 with st.container(border=True):
                     st.markdown(f"**{r['id']}** — {r['canonical_name']}  (vol{r['volume']:02d})  ·  {r['Status']}")
                     if r["duplicate_detail"]:
-                        st.caption(r["duplicate_detail"])
-                    if r["duplicate_status"] in ("warning", "blocked"):
-                        with st.expander("Compare with authority"):
-                            if r["duplicate_other_pk"]:
-                                render_compare_from_known("person", r["pk"], r["duplicate_other_pk"],
-                                                           key_suffix=f"_fr_{r['pk']}")
-                            else:
-                                render_compare_from_lookup("person", r["pk"], key_suffix=f"_fr_{r['pk']}")
+                        st.caption(r["duplicate_detail"] +
+                                   " — resolve this in the **Person Duplicates** tab or the **Review** tab.")
 
     with sub_final_pl:
         place_rows = [r for r in rows if r["entity_type"] == "place"]
@@ -1292,10 +1373,8 @@ with tab_final:
                 with st.container(border=True):
                     st.markdown(f"**{r['id']}** — {r['canonical_name']}  (vol{r['volume']:02d})  ·  {r['Status']}")
                     if r["duplicate_detail"]:
-                        st.caption(r["duplicate_detail"])
-                    if r["duplicate_status"] in ("warning", "blocked"):
-                        with st.expander("Compare with authority"):
-                            render_compare_from_lookup("place", r["pk"], key_suffix=f"_fr_{r['pk']}")
+                        st.caption(r["duplicate_detail"] +
+                                   " — resolve this in the **Place Duplicates** tab or the **Review** tab.")
 
     if n_blocked:
         st.caption("Rows marked BLOCKED will not be promoted until the duplicate is resolved.")
@@ -1315,15 +1394,15 @@ with tab_final:
 # ── tab: authority browser ─────────────────────────────────────────────────
 
 with tab_authority:
-    search = st.text_input("Search", placeholder="Filter by any field...", key="auth_search")
+    tb_auth = ui_widgets.render_filter_toolbar("authority")
     auth_pl_tab, auth_pe_tab = st.tabs(["Places", "Persons"])
 
     with auth_pl_tab:
         auth_pl = db.get_places(status="canonical")
         auth_pl = with_wikidata_links(auth_pl)
-        if search:
-            mask = auth_pl.apply(lambda r: search.lower() in " ".join(r.values.astype(str)).lower(), axis=1)
-            auth_pl = auth_pl[mask]
+        auth_pl = ui_widgets.filter_dataframe(auth_pl, search=tb_auth["search"])
+        if tb_auth["sort"] == "name":
+            auth_pl = auth_pl.sort_values("canonical_name")
         st.caption(f"{len(auth_pl)} entries")
         st.dataframe(
             auth_pl.drop(columns=["created_at", "updated_at"], errors="ignore"),
@@ -1334,9 +1413,9 @@ with tab_authority:
     with auth_pe_tab:
         auth_pe = db.get_persons(status="canonical")
         auth_pe = with_wikidata_links(auth_pe)
-        if search:
-            mask = auth_pe.apply(lambda r: search.lower() in " ".join(r.values.astype(str)).lower(), axis=1)
-            auth_pe = auth_pe[mask]
+        auth_pe = ui_widgets.filter_dataframe(auth_pe, search=tb_auth["search"])
+        if tb_auth["sort"] == "name":
+            auth_pe = auth_pe.sort_values("canonical_name")
         st.caption(f"{len(auth_pe)} entries")
         st.dataframe(
             auth_pe.drop(columns=["created_at", "updated_at"], errors="ignore"),
