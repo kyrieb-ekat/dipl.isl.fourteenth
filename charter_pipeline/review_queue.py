@@ -15,8 +15,13 @@ import db
 from diff_render import blank
 
 # Name-similarity score (from db.search_authority's rapidfuzz token_sort_ratio)
-# above which a New Entities item offers a direct "merge into this match"
-# action instead of only "confirm as genuinely new" / ok / skip.
+# at or above which a New Entities match is flagged as high-confidence --
+# merge is always offered regardless of score (a lower score can still be a
+# correct match the reviewer can see for themselves in the diff; forcing
+# "Add to authority" instead when merge wasn't offered was creating avoidable
+# duplicate canonical entries), but this threshold controls how it's
+# presented: primary-styled and ordered first when at/above it, secondary and
+# ordered last (just before "next") otherwise.
 MERGE_SUGGEST_THRESHOLD = 90
 
 ALL_ITEM_TYPES = {"new_person", "new_place", "person_dup", "place_dup", "review_item"}
@@ -77,6 +82,32 @@ def _place_diff_rows(left: dict, right: dict | None) -> list:
             for label, lk, rk in COMPARE_ROWS["place"]]
 
 
+def _is_high_confidence(match: dict | None) -> bool:
+    return bool(match) and match.get("_match_score", 0) >= MERGE_SUGGEST_THRESHOLD
+
+
+def _match_subheader(match: dict | None) -> str:
+    if not match:
+        return "No plausible authority match found."
+    score = match.get("_match_score", 0)
+    confidence = "High-confidence" if _is_high_confidence(match) else "Possible"
+    return f"{confidence} authority match: {match['display_id']}  (score {score:.0f})"
+
+
+def _merge_action(match: dict | None):
+    """Merge is always offered when any match exists, regardless of score --
+    only its styling/position signals confidence (primary + first when
+    high-confidence, secondary + last-before-next otherwise), so a reviewer
+    can still merge a lower-scoring but visibly-correct match instead of
+    being forced into "Add to authority", which would mint a duplicate
+    canonical entry alongside the real one."""
+    if not match:
+        return None
+    high = _is_high_confidence(match)
+    label = f"Merge into {match['display_id']} (m)" if high else f"Merge into {match['display_id']}? (m)"
+    return QueueAction("m", "merge", label, "primary" if high else "secondary")
+
+
 def _build_new_person_items(volumes: list | None) -> list:
     items = []
     df = db.get_persons(status="provisional", review_status="")
@@ -86,21 +117,26 @@ def _build_new_person_items(volumes: list | None) -> list:
         row = row.to_dict()
         matches = db.search_authority("person", row["canonical_name"], limit=1)
         match = matches[0] if matches else None
-        actions = [
+        merge_action = _merge_action(match)
+        high_confidence = _is_high_confidence(match)
+
+        actions = []
+        if merge_action and high_confidence:
+            actions.append(merge_action)
+        actions += [
             QueueAction("o", "ok", "OK (o)"),
             QueueAction("a", "add", "Add to authority (a)", "primary"),
             QueueAction("k", "skip", "Skip (k)"),
         ]
-        if match and match.get("_match_score", 0) >= MERGE_SUGGEST_THRESHOLD:
-            actions.append(QueueAction("m", "merge", f"Merge into {match['display_id']} (m)", "primary"))
+        if merge_action and not high_confidence:
+            actions.append(merge_action)
         actions.append(QueueAction("n", "next", "Next / not sure yet (n)"))
         items.append(QueueItem(
             item_id=f"new_person:{row['person_pk']}",
             item_type="new_person",
             volume=row["source_volume"],
             header=f"{row['canonical_name']}  ({row['display_id']})",
-            subheader=("Best authority match: " + match["display_id"] +
-                       f"  (score {match['_match_score']:.0f})") if match else "No plausible authority match found.",
+            subheader=_match_subheader(match),
             left_label="New person", right_label="Authority match",
             diff_rows=_person_diff_rows(row, match),
             actions=actions,
@@ -119,22 +155,27 @@ def _build_new_place_items(volumes: list | None) -> list:
         row = row.to_dict()
         matches = db.search_authority("place", row["canonical_name"], limit=1)
         match = matches[0] if matches else None
-        actions = [
+        merge_action = _merge_action(match)
+        high_confidence = _is_high_confidence(match)
+
+        actions = []
+        if merge_action and high_confidence:
+            actions.append(merge_action)
+        actions += [
             QueueAction("o", "ok", "OK (o)"),
             QueueAction("a", "add", "Add to authority (a)", "primary"),
             QueueAction("k", "skip", "Skip (k)"),
             QueueAction("x", "no_match", "No match / not a real place (x)"),
         ]
-        if match and match.get("_match_score", 0) >= MERGE_SUGGEST_THRESHOLD:
-            actions.append(QueueAction("m", "merge", f"Merge into {match['display_id']} (m)", "primary"))
+        if merge_action and not high_confidence:
+            actions.append(merge_action)
         actions.append(QueueAction("n", "next", "Next / not sure yet (n)"))
         items.append(QueueItem(
             item_id=f"new_place:{row['place_pk']}",
             item_type="new_place",
             volume=row["source_volume"],
             header=f"{row['canonical_name']}  ({row['display_id']})",
-            subheader=("Best authority match: " + match["display_id"] +
-                       f"  (score {match['_match_score']:.0f})") if match else "No plausible authority match found.",
+            subheader=_match_subheader(match),
             left_label="New place", right_label="Authority match",
             diff_rows=_place_diff_rows(row, match),
             actions=actions,
