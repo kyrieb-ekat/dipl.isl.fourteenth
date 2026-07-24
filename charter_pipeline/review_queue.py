@@ -11,6 +11,8 @@ grid-based tabs already use.
 """
 from dataclasses import dataclass, field
 
+import pandas as pd
+
 import db
 from diff_render import blank
 
@@ -87,9 +89,16 @@ def _to_int(v):
     row in the whole result set happened to be non-null -- a single NULL
     anywhere in that column upcasts the WHOLE column to float64 (numpy int
     arrays can't hold NaN), so e.g. row 4 -> 4.0 even though its own value
-    was never missing. QueueItem.volume must be a real int: review_app.py
-    formats it with :02d, which raises ValueError on a float."""
-    return None if v is None else int(v)
+    was never missing. Separately, a row's OWN value can be genuinely
+    missing too (e.g. a place with no source_volume) -- pandas represents
+    that as NaN (a float), NOT None, so `v is None` alone doesn't catch it;
+    checking pd.isna() first is required (same pitfall diff_render.blank()
+    already guards against). QueueItem.volume must end up a real int or
+    None: review_app.py formats it with :02d, which raises on a float and
+    int(nan) itself raises ValueError, so both cases must return None here."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    return int(v)
 
 
 def _is_high_confidence(match: dict | None) -> bool:
