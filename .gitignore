@@ -5,6 +5,8 @@ __pycache__/
 charter_pipeline/output/
 charter_pipeline/.venv/
 charter_pipeline/charter_pipeline.db
+charter_pipeline/charter_pipeline.db.bak*
+charter_pipeline/.snapshots/
 .claude/launch.json
 
 # nafnid.is/Árnastofnun scrape — personal working copy pending ToS confirmation

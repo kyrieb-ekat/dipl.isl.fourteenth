@@ -26,6 +26,8 @@ from config import SEGMENTS_DIR, ENTITIES_DIR, MODEL, MAX_TOKENS
 # ── System prompt (will be cached) ─────────────────────────────────────────
 SYSTEM_PROMPT = """You are an expert in medieval Icelandic documentary history specialising in the Diplomatarium Islandicum (DI) — the published edition of Icelandic medieval charters (bréf) and related documents from the 9th to 16th centuries.
 
+CRITICAL — CLOSED-BOOK EXTRACTION: Base every field strictly on the segment text given below, not on outside knowledge of the Diplomatarium Islandicum or any specific document in it, even if you recognize it. The segment's editorial apparatus may mention or cross-reference other documents (e.g. "sjá Nr. 21", a footnote citing a related privilege, a fascicle grouping) without quoting them — in that case, extract only what THIS segment's own text states, and do not describe the content, persons, dates, scribes, or seals of those other referenced documents from memory. If di_reference names a range (e.g. "nr. 4–7"), only report the range as such if the full text of each numbered document actually appears in the segment below; otherwise extract the single document this segment actually contains.
+
 Your task is to extract structured data from charter transcriptions. Each charter may be in Old/Middle Icelandic, Medieval Latin, or a mixture. Apply the following rules:
 
 PERSONS
