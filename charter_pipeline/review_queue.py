@@ -82,6 +82,16 @@ def _place_diff_rows(left: dict, right: dict | None) -> list:
             for label, lk, rk in COMPARE_ROWS["place"]]
 
 
+def _to_int(v):
+    """source_volume comes back from pandas as a genuine int only if every
+    row in the whole result set happened to be non-null -- a single NULL
+    anywhere in that column upcasts the WHOLE column to float64 (numpy int
+    arrays can't hold NaN), so e.g. row 4 -> 4.0 even though its own value
+    was never missing. QueueItem.volume must be a real int: review_app.py
+    formats it with :02d, which raises ValueError on a float."""
+    return None if v is None else int(v)
+
+
 def _is_high_confidence(match: dict | None) -> bool:
     return bool(match) and match.get("_match_score", 0) >= MERGE_SUGGEST_THRESHOLD
 
@@ -134,7 +144,7 @@ def _build_new_person_items(volumes: list | None) -> list:
         items.append(QueueItem(
             item_id=f"new_person:{row['person_pk']}",
             item_type="new_person",
-            volume=row["source_volume"],
+            volume=_to_int(row["source_volume"]),
             header=f"{row['canonical_name']}  ({row['display_id']})",
             subheader=_match_subheader(match),
             left_label="New person", right_label="Authority match",
@@ -173,7 +183,7 @@ def _build_new_place_items(volumes: list | None) -> list:
         items.append(QueueItem(
             item_id=f"new_place:{row['place_pk']}",
             item_type="new_place",
-            volume=row["source_volume"],
+            volume=_to_int(row["source_volume"]),
             header=f"{row['canonical_name']}  ({row['display_id']})",
             subheader=_match_subheader(match),
             left_label="New place", right_label="Authority match",
@@ -246,7 +256,7 @@ def _build_place_dup_items(volumes: list | None) -> list:
         items.append(QueueItem(
             item_id=f"place_dup:{row['candidate_pk']}",
             item_type="place_dup",
-            volume=row["source_volume"],
+            volume=_to_int(row["source_volume"]),
             header=f"{row['place_canonical_name']}  ({row['display_id']})  vs.  nafnid: {row['candidate_name']}",
             subheader=f"name_score={row['name_score']:.1f}  ·  distance={blank(row['distance_km'])} km  ·  "
                       f"flag={row['flag'] or 'none'}",
