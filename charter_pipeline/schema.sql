@@ -16,6 +16,14 @@ CREATE TABLE persons (
     display_id        TEXT NOT NULL UNIQUE,
     legacy_id         TEXT NOT NULL,
     source_volume     INTEGER,
+    -- semicolon-separated volume numbers this record has also appeared in via a
+    -- merge (see db.py's _merge_persons_impl) -- source_volume itself is
+    -- never overwritten by a merge (that could describe a real person's
+    -- presence across volumes, so combining is expected, not an error), this
+    -- is just a visible trail of what got folded in, and a flag: non-empty
+    -- means "this record spans more than one volume, don't assume
+    -- source_volume is the whole story."
+    merged_volumes    TEXT NOT NULL DEFAULT '',
     status            TEXT NOT NULL DEFAULT 'provisional'
                           CHECK (status IN ('provisional','canonical')),
     review_status     TEXT NOT NULL DEFAULT ''
@@ -45,6 +53,9 @@ CREATE TABLE places (
     display_id           TEXT NOT NULL UNIQUE,
     legacy_id            TEXT NOT NULL,
     source_volume        INTEGER,
+    -- see persons.merged_volumes -- same purpose, same "never overwrite
+    -- source_volume, just trail what merged in" rule.
+    merged_volumes       TEXT NOT NULL DEFAULT '',
     status               TEXT NOT NULL DEFAULT 'provisional'
                               CHECK (status IN ('provisional','canonical')),
     review_status        TEXT NOT NULL DEFAULT ''

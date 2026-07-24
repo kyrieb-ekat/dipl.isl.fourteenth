@@ -383,6 +383,25 @@ def _first_nonblank(values: list[str]) -> str:
     return ""
 
 
+def _merged_volumes_union(rows: list[dict]) -> str:
+    """rows[0] is the survivor. source_volume is never overwritten by a
+    merge -- combining two records that originated in different volumes can
+    legitimately mean the same person/place is genuinely attested in
+    charters across both volumes, so silently picking one would be actively
+    dangerous, not just imprecise. Every OTHER row's source_volume, plus
+    whatever any row (including the survivor, from an earlier merge) already
+    carries in merged_volumes, gets folded in here as the visible trail;
+    the survivor's own source_volume is excluded since that one is already
+    visible via source_volume itself."""
+    survivor_volume = rows[0].get("source_volume")
+    values = [r.get("merged_volumes") or "" for r in rows]
+    values += [str(r["source_volume"]) for r in rows[1:] if r.get("source_volume") is not None]
+    combined = _union_semicolon(values)
+    if survivor_volume is not None:
+        combined = ";".join(v for v in combined.split(";") if v.strip() != str(survivor_volume))
+    return combined
+
+
 def _merge_persons_impl(survivor_pk: int, dropped_pks: list[int]) -> dict:
     conn = get_connection()
     try:
@@ -409,16 +428,17 @@ def _merge_persons_impl(survivor_pk: int, dropped_pks: list[int]) -> dict:
             ends = [r.get("floruit_end") for r in rows if r.get("floruit_end") is not None]
             merged["floruit_start"] = min(starts) if starts else None
             merged["floruit_end"] = max(ends) if ends else None
+            merged["merged_volumes"] = _merged_volumes_union(rows)
 
             conn.execute(
                 """UPDATE persons SET variant_names=?, notes=?, sources=?, associated_places=?,
                    patronymic=?, occupation=?, title=?, gender=?, wikidata_id=?,
-                   floruit_start=?, floruit_end=?, updated_at=datetime('now')
+                   floruit_start=?, floruit_end=?, merged_volumes=?, updated_at=datetime('now')
                    WHERE person_pk = ?""",
                 (merged["variant_names"], merged["notes"], merged["sources"],
                  merged["associated_places"], merged["patronymic"], merged["occupation"],
                  merged["title"], merged["gender"], merged["wikidata_id"],
-                 merged["floruit_start"], merged["floruit_end"], survivor_pk),
+                 merged["floruit_start"], merged["floruit_end"], merged["merged_volumes"], survivor_pk),
             )
             # Relink every reference (junction rows, review-queue outcomes,
             # duplicate candidates) from the dropped ids to the survivor --
@@ -704,15 +724,16 @@ def _merge_places_impl(survivor_pk: int, dropped_pks: list[int]) -> dict:
             longs = [r.get("coordinates_long") for r in rows if r.get("coordinates_long") is not None]
             merged["coordinates_lat"] = lats[0] if lats else None
             merged["coordinates_long"] = longs[0] if longs else None
+            merged["merged_volumes"] = _merged_volumes_union(rows)
 
             conn.execute(
                 """UPDATE places SET variant_names=?, notes=?, sources=?, place_type=?, region=?,
                    district=?, modern_equivalent=?, wikidata_id=?, coordinates_lat=?,
-                   coordinates_long=?, updated_at=datetime('now') WHERE place_pk = ?""",
+                   coordinates_long=?, merged_volumes=?, updated_at=datetime('now') WHERE place_pk = ?""",
                 (merged["variant_names"], merged["notes"], merged["sources"], merged["place_type"],
                  merged["region"], merged["district"], merged["modern_equivalent"],
                  merged["wikidata_id"], merged["coordinates_lat"], merged["coordinates_long"],
-                 survivor_pk),
+                 merged["merged_volumes"], survivor_pk),
             )
             for pk in dropped_pks:
                 conn.execute("UPDATE charter_places SET place_pk=? WHERE place_pk=?", (survivor_pk, pk))
