@@ -131,7 +131,11 @@ def resolve_persons(
     floruit = db.to_int_or_none(charter_year_str)
 
     for p in persons:
-        name = p.get("name", "").strip()
+        # .get(field, default) only substitutes when the key is *missing* --
+        # the model sometimes emits an explicit "name": null for a
+        # role-only mention (e.g. saint-patron qualifiers naming the saint
+        # rather than a person), so None must be coalesced before .strip().
+        name = (p.get("name") or "").strip()
         if not name:
             continue
 
@@ -280,13 +284,13 @@ def resolve_places(
                     "place_id": pk, "match_score": 0}, None
 
     for loc in locations:
-        r, review = resolve_one(loc.get("name", ""), loc.get("role", "loc.mentioned"), loc.get("region", ""))
+        r, review = resolve_one((loc.get("name") or ""), loc.get("role", "loc.mentioned"), loc.get("region", ""))
         resolved.append(r)
         if review:
             review_items.append(review)
 
     # Also resolve bare place names from all_places_mentioned (loc.mentioned)
-    already_named = {loc.get("name", "").lower() for loc in locations}
+    already_named = {(loc.get("name") or "").lower() for loc in locations}
     for name in all_places:
         if name.lower() not in already_named:
             r, review = resolve_one(name, "loc.mentioned", "")

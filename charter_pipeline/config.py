@@ -41,7 +41,11 @@ NAFNID_LOOKUP_DIR  = NAFNID_DIR / "lookup_tables"
 
 # ── Claude API ─────────────────────────────────────────────────────────────
 MODEL = "claude-sonnet-4-6"
-MAX_TOKENS = 4096
+# 4096 truncated the JSON response mid-object on vol04's larger charters
+# (segments up to ~20KB, well above the ~1.5KB median) -- confirmed via
+# "Unterminated string"/"Expecting property name" parse errors landing
+# exactly on the largest-segment outliers on a real reparse.
+MAX_TOKENS = 8192
 BATCH_SIZE = 10          # charters per API call (each is a separate message)
 
 # ── Entity resolution thresholds ───────────────────────────────────────────
