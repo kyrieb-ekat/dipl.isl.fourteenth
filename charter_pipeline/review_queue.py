@@ -37,6 +37,13 @@ MERGE_SUGGEST_THRESHOLD = 90
 
 ALL_ITEM_TYPES = {"new_person", "new_place", "person_dup", "place_dup", "review_item"}
 
+# Item types where selecting 2+ entries and merging them together (peer-to-
+# peer, not "into an authority match") is semantically real -- place_dup
+# compares a DI place against an external, non-mergeable nafnid.is record,
+# and review_item is accept/reject on a charter reference, not a mergeable
+# entity, so both are excluded.
+MERGEABLE_ITEM_TYPES = {"new_person", "new_place", "person_dup"}
+
 
 @dataclass
 class QueueAction:
@@ -75,6 +82,10 @@ class QueueIndexEntry:
                             # those two types fall back to their DB query's own
                             # highest-confidence-first ORDER BY instead.
     sort_name: str          # lowercased, for "name" sort -- cheap for every type
+    list_label: str         # human-readable one-line label for the List+detail view's
+                              # list pane -- cheap for every type, built from the same
+                              # already-fetched row dict as sort_name/search_text, no
+                              # materialize() needed just to list an entry.
     search_text: str        # lowercased raw fields this entry can be found by.
                               # Full fidelity for person_dup/place_dup/review_item (their
                               # subheader/diff text is already all raw row data, nothing
@@ -174,6 +185,7 @@ def _index_new_person_items(volumes: list | None) -> list:
             volume=_to_int(row["source_volume"]),
             sort_score=0.0,
             sort_name=(row["canonical_name"] or "").lower(),
+            list_label=f"{row['canonical_name']}  ({row['display_id']})",
             search_text=f"{row['canonical_name']} {row['display_id']}".lower(),
             row=row,
         ))
@@ -230,6 +242,7 @@ def _index_new_place_items(volumes: list | None) -> list:
             volume=_to_int(row["source_volume"]),
             sort_score=0.0,
             sort_name=(row["canonical_name"] or "").lower(),
+            list_label=f"{row['canonical_name']}  ({row['display_id']})",
             search_text=f"{row['canonical_name']} {row['display_id']}".lower(),
             row=row,
         ))
@@ -293,6 +306,7 @@ def _index_person_dup_items(volumes: list | None) -> list:
             volume=None,
             sort_score=row["name_score"] or 0,
             sort_name=f"{row['a_canonical_name']}  {row['b_canonical_name']}".lower(),
+            list_label=f"{row['a_canonical_name']}  vs.  {row['b_canonical_name']}",
             search_text=search_text,
             row=row,
         ))
@@ -359,6 +373,7 @@ def _index_place_dup_items(volumes: list | None) -> list:
             volume=_to_int(row["source_volume"]),
             sort_score=row["name_score"] or 0,
             sort_name=f"{row['place_canonical_name']}  {row['candidate_name']}".lower(),
+            list_label=f"{row['place_canonical_name']}  vs. nafnid: {row['candidate_name']}",
             search_text=search_text,
             row=row,
         ))
@@ -410,6 +425,7 @@ def _index_review_items(volumes: list | None) -> list:
                 volume=vn,
                 sort_score=row["score"] or 0,
                 sort_name=(row["extracted_name"] or "").lower(),
+                list_label=f"{row['extracted_name']}  ({row['entity_type']})",
                 search_text=search_text,
                 row=row,
             ))
@@ -564,3 +580,41 @@ def apply_action(item: QueueItem, action_key: str) -> dict:
         return {"action": action_key, **result}
 
     raise ValueError(f"Unknown item_type {item.item_type!r}")
+
+
+def apply_multi_merge(entries: list) -> dict:
+    """Merges 2+ selected QueueIndexEntry objects together -- the List+detail
+    view's cross-item counterpart to the single-item "merge" action. Deliberately
+    takes cheap index entries, not materialized QueueItems: the pks needed here
+    already live in entry.row (every index builder stores the full raw DB row),
+    so this never needs materialize()'s db.search_authority() call at all.
+
+    Survivor = lowest pk, matching the existing "oldest wins" convention
+    db.merge_persons/merge_places already document."""
+    if len(entries) < 2:
+        raise ValueError("Need at least 2 entries to merge.")
+    item_types = {e.item_type for e in entries}
+    if len(item_types) > 1:
+        raise ValueError(f"Can't merge a mix of item types: {sorted(item_types)}. "
+                          "Select entries of only one type.")
+    item_type = entries[0].item_type
+    if item_type not in MERGEABLE_ITEM_TYPES:
+        raise ValueError(f"{item_type!r} entries can't be merged with each other.")
+
+    if item_type in ("new_person", "new_place"):
+        pk_field = "person_pk" if item_type == "new_person" else "place_pk"
+        pks = sorted(e.row[pk_field] for e in entries)
+        survivor, dropped = pks[0], pks[1:]
+        merge_fn = db.merge_persons if item_type == "new_person" else db.merge_places
+        result = merge_fn(survivor, dropped)
+        return {"item_type": item_type, "survivor_pk": survivor, **result}
+
+    # person_dup: each entry is already a candidate PAIR, not a single pk --
+    # union every pair's two pks first (dedupes correctly if selected pairs
+    # overlap, e.g. A-B and B-C selected together), then merge same as above.
+    pks = sorted({pk for e in entries for pk in (e.row["person_a_pk"], e.row["person_b_pk"])})
+    survivor, dropped = pks[0], pks[1:]
+    result = db.merge_persons(survivor, dropped)
+    for e in entries:
+        db.record_person_duplicate_decision(e.row["candidate_pk"], "same")
+    return {"item_type": item_type, "survivor_pk": survivor, **result}

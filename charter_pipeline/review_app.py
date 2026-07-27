@@ -645,6 +645,49 @@ _QUEUE_TYPE_LABELS = {
     "review_item": "Review queue item",
 }
 
+
+def _render_item_card(rq_item, on_action=None) -> None:
+    """Renders one item's header/diff-table/action-buttons + wires up
+    hotkeys -- shared by both Review-tab view modes (single-card sequential,
+    and List+detail) so they render identically. Calls apply_action() for
+    any non-"next" click, then on_action(action_key) if given (the two
+    modes advance/reset differently after an action -- single-card moves a
+    position counter, List+detail just lets its own row-set-changed check
+    remount the list -- so that's left to the caller), then st.rerun().
+
+    Widget key is the action name ALONE (stable across items/reruns), not
+    item_id -- item_id contains a literal ":" (e.g. "new_place:157"),
+    invalid inside the CSS class selector hotkeys.bind_hotkeys builds from
+    it. One bind_hotkeys() call per render (not one per button) keeps this
+    to a single extra invisible iframe -- with one iframe per button (an
+    earlier attempt using the third-party streamlit-shortcuts package),
+    keyboard focus intermittently got captured by one of the many 0-height
+    iframes and real keydown events then never reached the page-level
+    listener at all."""
+    with st.container(border=True):
+        st.markdown(f"#### {rq_item.header}")
+        st.caption(rq_item.subheader)
+        diff_render.render_diff_table(rq_item.diff_rows, rq_item.left_label, rq_item.right_label)
+
+        btn_cols = st.columns(len(rq_item.actions))
+        action_hotkeys = {}
+        for col, rq_action in zip(btn_cols, rq_item.actions):
+            with col:
+                clicked = st.button(
+                    rq_action.label, key=f"rq_act_{rq_action.action}",
+                    type="primary" if rq_action.style == "primary" else "secondary",
+                )
+                action_hotkeys[f"rq_act_{rq_action.action}"] = rq_action.hotkey
+                if clicked:
+                    if rq_action.action != "next":
+                        review_queue.apply_action(rq_item, rq_action.action)
+                        st.toast(f"{rq_action.label.split(' (')[0]} — done.")
+                    if on_action:
+                        on_action(rq_action.action)
+                    st.rerun()
+        hotkeys.bind_hotkeys(action_hotkeys)
+
+
 with tab_review:
     undo_widget("review")
     st.caption(
@@ -677,6 +720,13 @@ with tab_review:
         st.session_state["_queue_filter_sig"] = rq_filt_sig
         st.session_state["_queue_pos"] = 0
         st.session_state["_queue_prefetch"] = None
+
+    rq_mode = st.radio(
+        "View", ["Single card", "List + detail"], key="rq_mode", horizontal=True,
+        help="Single card: fast, keyboard-driven, one decision at a time. "
+             "List + detail: browse many at once (e.g. sorted by name, to spot "
+             "look-alike spellings that are probably the same place/person), "
+             "then optionally merge several selected ones together.")
 
     @st.fragment
     def render_review_queue_fragment(rq_filt):
@@ -712,53 +762,24 @@ with tab_review:
                    f"{_QUEUE_TYPE_LABELS[rq_item.item_type]}"
                    + (f" · vol{rq_item.volume:02d}" if rq_item.volume else ""))
 
-        with st.container(border=True):
-            st.markdown(f"#### {rq_item.header}")
-            st.caption(rq_item.subheader)
-            diff_render.render_diff_table(rq_item.diff_rows, rq_item.left_label, rq_item.right_label)
+        def _advance(action_key):
+            if action_key == "next":
+                # This item stays in the live queue (nothing was decided) --
+                # explicitly advance position, unlike every other action,
+                # where the acted-on item drops out of build_queue_index()'s
+                # result on its own and the same index naturally lands on
+                # the next item for free. Prefetch survives (a "next" is a
+                # pure no-op, nothing it could have invalidated), so the
+                # item about to be shown is already materialized.
+                st.session_state["_queue_pos"] = rq_pos + 1
+            else:
+                # Unlike "next", a real action can change data the
+                # prefetched next item's own materialization depended on
+                # (e.g. a merge changing the authority table) -- don't trust
+                # it, recompute fresh next render.
+                st.session_state["_queue_prefetch"] = None
 
-            btn_cols = st.columns(len(rq_item.actions))
-            # Widget key is the action name ALONE (stable across items/reruns),
-            # not item_id -- item_id contains a literal ":" (e.g.
-            # "new_place:157"), invalid inside the CSS class selector
-            # hotkeys.bind_hotkeys builds from it. One bind_hotkeys() call per
-            # render (below), not one per button, keeps this to a single
-            # extra invisible iframe -- with one iframe per button (an
-            # earlier attempt using the third-party streamlit-shortcuts
-            # package), keyboard focus intermittently got captured by one of
-            # the many 0-height iframes and real keydown events then never
-            # reached the page-level listener at all.
-            action_hotkeys = {}
-            for col, rq_action in zip(btn_cols, rq_item.actions):
-                with col:
-                    clicked = st.button(
-                        rq_action.label, key=f"rq_act_{rq_action.action}",
-                        type="primary" if rq_action.style == "primary" else "secondary",
-                    )
-                    action_hotkeys[f"rq_act_{rq_action.action}"] = rq_action.hotkey
-                    if clicked:
-                        if rq_action.action == "next":
-                            # This item stays in the live queue (nothing was
-                            # decided) -- explicitly advance position, unlike
-                            # every other action, where the acted-on item
-                            # drops out of build_queue_index()'s result on its
-                            # own and the same index naturally lands on the
-                            # next item for free. Prefetch survives (a
-                            # "next" is a pure no-op, nothing it could have
-                            # invalidated), so the item about to be shown is
-                            # already materialized.
-                            st.session_state["_queue_pos"] = rq_pos + 1
-                        else:
-                            review_queue.apply_action(rq_item, rq_action.action)
-                            st.toast(f"{rq_action.label.split(' (')[0]} — done.")
-                            # Unlike "next", a real action can change data the
-                            # prefetched next item's own materialization
-                            # depended on (e.g. a merge changing the
-                            # authority table) -- don't trust it, recompute
-                            # fresh next render.
-                            st.session_state["_queue_prefetch"] = None
-                        st.rerun()
-            hotkeys.bind_hotkeys(action_hotkeys)
+        _render_item_card(rq_item, on_action=_advance)
 
         # Prefetch the item one position ahead now, while nothing has been
         # clicked yet -- by the time the user does click, the following
@@ -773,7 +794,84 @@ with tab_review:
         else:
             st.session_state["_queue_prefetch"] = None
 
-    render_review_queue_fragment(rq_filt)
+    @st.fragment
+    def render_review_queue_list_fragment(rq_filt):
+        # Second, separate fragment (not shared with the single-card mode's)
+        # so each mode's rerun cost stays isolated from the other's.
+        rq_index = review_queue.build_queue_index(rq_filt)
+
+        if not rq_index:
+            st.success("Queue complete for this filter. 🎉")
+            return
+
+        # Force a clean widget remount whenever the underlying row-identity
+        # set changes for ANY reason -- an action taken here, OR the
+        # single-card mode / another tab mutating the same data -- same
+        # fix as reset_snapshot_on_rowset_change elsewhere in this file,
+        # applied to st.dataframe's own selection state instead of a
+        # data_editor snapshot. Without this, a stable widget key paired
+        # with reshaped data risks stale/wrong row positions being reported
+        # as "selected" (every real action here always removes the acted-on
+        # entry from the next build_queue_index() call, so this alone is
+        # enough to reset selection after any action -- no separate
+        # on_action callback needed for the single-selected-item card below).
+        row_fp = tuple(sorted(e.item_id for e in rq_index))
+        if st.session_state.get("_rq_list_rowset") != row_fp:
+            st.session_state["_rq_list_rowset"] = row_fp
+            bump("rq_list")
+        list_key = f"rq_list_{mergever('rq_list')}"
+
+        list_df = pd.DataFrame([
+            {"Name": e.list_label, "Type": _QUEUE_TYPE_LABELS[e.item_type],
+             "Score": round(e.sort_score, 1) if e.sort_score else None,
+             "Vol": f"vol{e.volume:02d}" if e.volume else ""}
+            for e in rq_index
+        ])
+        st.caption(f"**{len(rq_index)}** items in queue for this filter. "
+                   "Select one to preview, or several to merge them together.")
+        result = st.dataframe(
+            list_df, hide_index=True, use_container_width=True,
+            on_select="rerun", selection_mode="multi-row", key=list_key,
+            height=min(400, 78 + 35 * len(rq_index)),
+        )
+        selected_positions = result["selection"]["rows"]
+
+        if not selected_positions:
+            st.info("Select a row above to preview it here.")
+            return
+
+        selected_entries = [rq_index[i] for i in selected_positions]
+
+        if len(selected_entries) == 1:
+            rq_item = review_queue.materialize(selected_entries[0])
+            _render_item_card(rq_item)
+            return
+
+        # 2+ selected: lightweight summary only, no materialize() calls.
+        st.write(f"**{len(selected_entries)} items selected:**")
+        for e in selected_entries:
+            st.caption(f"- {e.list_label}")
+
+        item_types = {e.item_type for e in selected_entries}
+        if len(item_types) > 1:
+            st.warning(f"Selected items are a mix of types "
+                       f"({', '.join(_QUEUE_TYPE_LABELS[t] for t in sorted(item_types))}) -- "
+                       "select entries of only one type to merge them.")
+            return
+        item_type = selected_entries[0].item_type
+        if item_type not in review_queue.MERGEABLE_ITEM_TYPES:
+            st.warning(f"{_QUEUE_TYPE_LABELS[item_type]} items can't be merged with each other.")
+            return
+
+        if st.button(f"Merge {len(selected_entries)} selected", type="primary", key="rq_multi_merge"):
+            merge_result = review_queue.apply_multi_merge(selected_entries)
+            st.toast(f"Merged {len(selected_entries)} item(s) into survivor pk={merge_result['survivor_pk']}.")
+            st.rerun()
+
+    if rq_mode == "Single card":
+        render_review_queue_fragment(rq_filt)
+    else:
+        render_review_queue_list_fragment(rq_filt)
 
 
 # ── tab: charters ────────────────────────────────────────────────────────────
