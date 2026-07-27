@@ -108,6 +108,10 @@ class QueueFilter:
                                                     # require materializing every row, defeating the
                                                     # point of this module).
     sort: str = "default"                         # "default" | "score_desc" | "score_asc" | "name"
+    flagged_only: bool = False                    # new_person only -- surfaces persons.data_quality_flag
+                                                     # rows regardless of volume/status/review_status (a
+                                                     # flagged row can already be canonical/reviewed), for
+                                                     # the 09_flag_transmission_actors.py follow-up workflow.
 
 
 def _person_diff_rows(left: dict, right: dict | None) -> list:
@@ -169,9 +173,10 @@ def _merge_action(match: dict | None):
 
 # ── new_person ────────────────────────────────────────────────────────────
 
-def _index_new_person_items(volumes: list | None) -> list:
+def _index_new_person_items(volumes: list | None, flagged_only: bool = False) -> list:
     entries = []
-    df = db.get_persons(status="provisional", review_status="")
+    df = db.get_persons(flagged_only=True) if flagged_only \
+        else db.get_persons(status="provisional", review_status="")
     if volumes:
         df = df[df["source_volume"].isin(volumes)]
     for row in df.to_dict("records"):
@@ -482,7 +487,10 @@ def build_queue_index(filt: QueueFilter) -> list:
     on exactly the entry you're about to display."""
     entries = []
     for item_type in filt.item_types:
-        entries.extend(_INDEX_BUILDERS[item_type](filt.volumes))
+        if item_type == "new_person" and filt.flagged_only:
+            entries.extend(_index_new_person_items(filt.volumes, flagged_only=True))
+        else:
+            entries.extend(_INDEX_BUILDERS[item_type](filt.volumes))
 
     if filt.search:
         needle = filt.search.strip().lower()

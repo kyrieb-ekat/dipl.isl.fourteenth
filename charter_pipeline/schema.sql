@@ -28,6 +28,15 @@ CREATE TABLE persons (
                           CHECK (status IN ('provisional','canonical')),
     review_status     TEXT NOT NULL DEFAULT ''
                           CHECK (review_status IN ('', 'ok', 'add', 'skip')),
+    -- Set by 09_flag_transmission_actors.py -- non-empty means this row is
+    -- suspected of actually being a later manuscript-transmission actor (a
+    -- copyist/editor/annotator from centuries after the charter's own date)
+    -- rather than a genuine period-contemporary person, mis-minted here by
+    -- 03_resolve_entities.py stamping the charter's own date as floruit
+    -- regardless. Purely advisory -- independent of status/review_status,
+    -- so it can flag a row for a second look even if already reviewed or
+    -- promoted, without touching either field.
+    data_quality_flag TEXT NOT NULL DEFAULT '',
     canonical_name    TEXT NOT NULL,
     variant_names     TEXT NOT NULL DEFAULT '',
     wikidata_id       TEXT NOT NULL DEFAULT '',

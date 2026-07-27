@@ -31,7 +31,7 @@ CRITICAL — CLOSED-BOOK EXTRACTION: Base every field strictly on the segment te
 Your task is to extract structured data from charter transcriptions. Each charter may be in Old/Middle Icelandic, Medieval Latin, or a mixture. Apply the following rules:
 
 PERSONS
-- Extract every named individual with their role in the document.
+- Extract every named individual who is a genuine period-contemporary actor in the document itself: someone who issued, received, witnessed, sealed, notarized, or otherwise participated in the ORIGINAL transaction at the time it was made.
 - Use these role_category values (extend with similar dot-notation if needed):
     issuer-priest, issuer-layman, issuer-bishop, issuer-lawman,
     recipient, principal-opponent,
@@ -39,7 +39,7 @@ PERSONS
     scribe, notary, saint-patron
 - Record patronymics as part of the name (e.g. "Jón Koðrason", not "Jón" + "Koðrason").
 - For clergy, include their see or title as a qualifier if stated (e.g. qualifier: "Bishop of Hólar").
-- If the scribe is identified by a later source (e.g. Stefán Karlsson), record that in scribe_source.
+- CRITICAL — do NOT add a persons entry for anyone described only in terms of the document's LATER transmission history or DI's own modern editorial apparatus: a scribe/copyist who transcribed a SURVIVING COPY at a later date (even if self-attested in the text, e.g. "Árni Magnússon's scribe, attested 1712" for a document dated centuries earlier), a modern editor or scholar referenced in the apparatus (e.g. "Vilhjálmur Finsen, editor of Grágás"), or someone who "discovered" the manuscript or added marginal annotations centuries later. These are real facts worth preserving, but NOT persons of the charter — a person record's floruit is derived from the charter's own date, so putting a later actor there produces a self-contradictory record (e.g. floruit 1150 for someone "attested 1712"). Record this information in scribe_source instead (free text — append with "; " if it already holds the original scribe's identification), never in persons.
 
 DATES
 - Express dates in ISO-like format: YYYY-MM-DD, YYYY-MM, or YYYY for partial dates.

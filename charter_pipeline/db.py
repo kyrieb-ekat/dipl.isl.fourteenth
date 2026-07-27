@@ -222,7 +222,8 @@ def undo_last_action() -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_persons(status: str | None = None, source_volume: int | None = None,
-                 review_status: str | None = None,
+                 review_status: str | None = None, data_quality_flag: str | None = None,
+                 flagged_only: bool = False,
                  conn: sqlite3.Connection | None = None) -> pd.DataFrame:
     own = conn is None
     conn = conn or get_connection()
@@ -234,6 +235,13 @@ def get_persons(status: str | None = None, source_volume: int | None = None,
             q += " AND source_volume = ?"; params.append(source_volume)
         if review_status is not None:
             q += " AND review_status = ?"; params.append(review_status)
+        if data_quality_flag is not None:
+            q += " AND data_quality_flag = ?"; params.append(data_quality_flag)
+        if flagged_only:
+            # Independent of status/review_status on purpose -- a flagged row
+            # can already be canonical/reviewed, and still needs to be
+            # reachable for a second look rather than invisible once promoted.
+            q += " AND data_quality_flag != ''"
         # ORDER BY is required, not cosmetic: without it SQLite doesn't
         # guarantee the same row order across two calls returning identical
         # rows, which broke UI dirty-checking (row-order-sensitive .equals())

@@ -707,15 +707,21 @@ with tab_review:
             format_func=lambda t: _QUEUE_TYPE_LABELS[t], key="rq_types")
     rq_tb = ui_widgets.render_filter_toolbar(
         "review_queue", sort_options=ui_widgets.SCORE_SORT_OPTIONS)
+    rq_flagged_only = st.checkbox(
+        "Data-quality flagged persons only", value=False, key="rq_flagged_only",
+        help="Surfaces persons.data_quality_flag rows (set by "
+             "09_flag_transmission_actors.py) across all volumes, regardless of "
+             "status/review_status -- narrows to just New person items while checked.")
 
     rq_filt = review_queue.QueueFilter(
         volumes=rq_volumes or None,
-        item_types=set(rq_types) if rq_types else set(review_queue.ALL_ITEM_TYPES),
-        search=rq_tb["search"], sort=rq_tb["sort"],
+        item_types={"new_person"} if rq_flagged_only
+                    else (set(rq_types) if rq_types else set(review_queue.ALL_ITEM_TYPES)),
+        search=rq_tb["search"], sort=rq_tb["sort"], flagged_only=rq_flagged_only,
     )
 
     rq_filt_sig = (tuple(sorted(rq_filt.volumes or [])), tuple(sorted(rq_filt.item_types)),
-                   rq_filt.search, rq_filt.sort)
+                   rq_filt.search, rq_filt.sort, rq_filt.flagged_only)
     if st.session_state.get("_queue_filter_sig") != rq_filt_sig:
         st.session_state["_queue_filter_sig"] = rq_filt_sig
         st.session_state["_queue_pos"] = 0
@@ -1094,9 +1100,17 @@ with tab_entities:
         pkey = f"{vol}_persons"
         st.caption("New-vs-authority comparison and ok/add/skip decisions now happen in the "
                    "**Review** tab. This grid is for bulk field edits and merging duplicate rows.")
-        df_p_all = db.get_persons(status="provisional", source_volume=vn)
+        flagged_only_p = st.checkbox(
+            "Data-quality flagged only (ignores volume/status below)", value=False, key=f"{pkey}_flagged_only",
+            help="Rows 09_flag_transmission_actors.py suspects are actually later "
+                 "manuscript-transmission actors (copyists/editors/annotators), not "
+                 "period-contemporary persons -- shown across all volumes and regardless "
+                 "of status/review_status, since a flagged row can already be canonical "
+                 "or reviewed.")
+        df_p_all = db.get_persons(flagged_only=True) if flagged_only_p \
+            else db.get_persons(status="provisional", source_volume=vn)
         if df_p_all.empty:
-            st.info("No new persons for this volume.")
+            st.info("No flagged persons." if flagged_only_p else "No new persons for this volume.")
         else:
             tb_p = ui_widgets.render_filter_toolbar(pkey, status_options=["", "ok", "skip", "add"])
             df_p = ui_widgets.filter_dataframe(
@@ -1116,21 +1130,27 @@ with tab_entities:
 
                 editable_p = ["review_status", "canonical_name", "wikidata_id", "variant_names",
                               "patronymic", "occupation", "title", "floruit_start", "floruit_end",
-                              "gender", "associated_places", "notes"]
+                              "gender", "associated_places", "notes", "data_quality_flag"]
 
                 edited_p = st.data_editor(
                     with_checkbox(with_wikidata_links(df_p), pkey, "person_pk"),
                     key=f"ed_{pkey}_{mv}",
                     use_container_width=True, num_rows="fixed", hide_index=True,
-                    column_order=["select", "person_pk", "display_id", "review_status", "canonical_name",
-                                  "wikidata_id", "wikidata_link", "variant_names", "patronymic",
-                                  "occupation", "title", "floruit_start", "floruit_end", "gender",
+                    column_order=["select", "person_pk", "display_id", "data_quality_flag", "review_status",
+                                  "canonical_name", "wikidata_id", "wikidata_link", "variant_names",
+                                  "patronymic", "occupation", "title", "floruit_start", "floruit_end", "gender",
                                   "associated_places", "notes", "sources"],
                     column_config={
                         "select": st.column_config.CheckboxColumn(
                             "Select", width="small", help="Check 2+ rows to merge them."),
                         "person_pk": None,
                         "display_id": st.column_config.TextColumn("ID", width="small", disabled=True),
+                        "data_quality_flag": st.column_config.TextColumn(
+                            "Flag", width="small",
+                            help="Set by 09_flag_transmission_actors.py. Clear it (blank) once you've "
+                                 "confirmed this row -- whether it's a real later-transmission actor to "
+                                 "fix/delete, or a false positive (e.g. a genuine period-contemporary person "
+                                 "who happens to share a name with someone from a different era)."),
                         "review_status": st.column_config.SelectboxColumn(
                             "Status", options=["", "ok", "skip", "add"], width="small"),
                         "canonical_name": st.column_config.TextColumn("Canonical name", width="medium"),
