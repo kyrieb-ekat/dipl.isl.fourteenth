@@ -88,6 +88,26 @@ def reset_snapshot_on_filter_change(session_key: str, filter_sig) -> None:
         bump(session_key)
 
 
+def reset_snapshot_on_rowset_change(session_key: str, pks) -> None:
+    """Same purpose as reset_snapshot_on_filter_change, but for a different
+    trigger: the underlying row set can now also change for a reason
+    entirely outside this tab's own bump() calls -- the Review tab mutates
+    the exact same underlying tables (persons/places/duplicate-candidates/
+    review_queue_items) via its own, separate action codepath, with no
+    reason to know this tab's session_key exists. Call this with the FULL
+    (pre-filter) set of pks for session_key, once per render, right
+    alongside reset_snapshot_on_filter_change -- if the actual row set
+    differs from last render for ANY reason, bump immediately, before the
+    grid renders, so st.data_editor never gets a stale key paired with
+    reshaped data (which is what was silently dropping pending edits/
+    selections)."""
+    fp = tuple(sorted(pks))
+    key = f"_rowset_{session_key}"
+    if st.session_state.get(key) != fp:
+        st.session_state[key] = fp
+        bump(session_key)
+
+
 def apply_row_diffs(before_df: pd.DataFrame, after_df: pd.DataFrame, id_col: str,
                      update_fn, editable_cols: list[str]) -> int:
     """For every row where any editable_cols value differs between before_df
@@ -794,6 +814,7 @@ with tab_charters:
             readonly_cols = ["charter_pk", "sequence", "di_reference", "Status", "notes"]
             reset_snapshot_on_filter_change(
                 ckey, (flagged_only, tb_c["search"], tb_c["sort"]))
+            reset_snapshot_on_rowset_change(ckey, df_c_all["charter_pk"])
             # Snapshot the SAME column subset handed to the editor below -- snapshotting
             # the full fetched frame here would make is_dirty() always report dirty
             # (column-set mismatch always fails .equals()).
@@ -876,6 +897,7 @@ with tab_queue:
                 st.info("No rows match this filter.")
             else:
                 reset_snapshot_on_filter_change(qkey, (tb_q["status"], tb_q["search"], tb_q["sort"]))
+                reset_snapshot_on_rowset_change(qkey, df_q_all["review_item_pk"])
                 ensure_snapshot(qkey, df_q)
                 mv = mergever(qkey)
                 edited_q = st.data_editor(
@@ -989,6 +1011,7 @@ with tab_entities:
                 st.info("No rows match this filter.")
             else:
                 reset_snapshot_on_filter_change(pkey, (tb_p["status"], tb_p["search"], tb_p["sort"]))
+                reset_snapshot_on_rowset_change(pkey, df_p_all["person_pk"])
                 df_p = blank_if_null(df_p, ["floruit_start", "floruit_end"])
                 ensure_snapshot(pkey, df_p)
                 mv = mergever(pkey)
@@ -1086,6 +1109,7 @@ with tab_entities:
                 st.info("No rows match this filter.")
             else:
                 reset_snapshot_on_filter_change(plkey, (tb_pl["status"], tb_pl["search"], tb_pl["sort"]))
+                reset_snapshot_on_rowset_change(plkey, df_pl_all["place_pk"])
                 df_pl = blank_if_null(df_pl, ["coordinates_lat", "coordinates_long", "geo_match_score"])
                 ensure_snapshot(plkey, df_pl)
                 mv = mergever(plkey)
@@ -1217,6 +1241,7 @@ with tab_dupes:
             st.info("No rows match this filter.")
         else:
             reset_snapshot_on_filter_change(dkey, (tb_d["status"], tb_d["search"], tb_d["sort"]))
+            reset_snapshot_on_rowset_change(dkey, df_dupes_all["candidate_pk"])
             ensure_snapshot(dkey, df_dupes)
             mv = mergever(dkey)
             edited_dupes = st.data_editor(
@@ -1325,6 +1350,7 @@ with tab_place_dupes:
         else:
             reset_snapshot_on_filter_change(
                 pdkey, (tuple(sorted(tb_pd["volumes"] or [])), tb_pd["status"], tb_pd["search"], tb_pd["sort"]))
+            reset_snapshot_on_rowset_change(pdkey, df_pdupes_all["candidate_pk"])
             ensure_snapshot(pdkey, df_pdupes)
             mv = mergever(pdkey)
             edited_pdupes = st.data_editor(
