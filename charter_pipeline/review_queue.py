@@ -522,12 +522,20 @@ def apply_action(item: QueueItem, action_key: str) -> dict:
         return {"action": "next"}
 
     if item.item_type == "new_person":
+        # ok/add/skip also clear data_quality_flag -- the reviewer has just
+        # decided whether this flagged row's data is fine (add/ok) or not
+        # (skip), so the flag has served its purpose. Without this, the
+        # flagged-only queue (db.get_persons(flagged_only=True), which has
+        # no review_status condition at all) would keep matching this exact
+        # row forever, making the action look like it silently did nothing.
+        # merge needs no equivalent -- merge_into_authority already removes
+        # the provisional row entirely.
         if action_key == "ok":
-            db.update_person(p["pk"], review_status="ok")
+            db.update_person(p["pk"], review_status="ok", data_quality_flag="")
         elif action_key == "add":
-            db.update_person(p["pk"], review_status="add")
+            db.update_person(p["pk"], review_status="add", data_quality_flag="")
         elif action_key == "skip":
-            db.update_person(p["pk"], review_status="skip")
+            db.update_person(p["pk"], review_status="skip", data_quality_flag="")
         elif action_key == "merge":
             db.merge_into_authority("person", p["pk"], p["match_pk"])
         else:
