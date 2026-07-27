@@ -656,19 +656,39 @@ with tab_review:
     if st.session_state.get("_queue_filter_sig") != rq_filt_sig:
         st.session_state["_queue_filter_sig"] = rq_filt_sig
         st.session_state["_queue_pos"] = 0
+        st.session_state["_queue_prefetch"] = None
 
-    rq_items = review_queue.build_queue(rq_filt)
-    rq_pos = st.session_state.get("_queue_pos", 0)
+    @st.fragment
+    def render_review_queue_fragment(rq_filt):
+        # Scoped to its own fragment so an action click's st.rerun() doesn't
+        # force every OTHER tab's (possibly expensive) grids to re-render too
+        # -- Streamlit's st.tabs() renders every tab's body in the DOM
+        # regardless of which is visible, same fact behind the earlier
+        # hotkey-leak fix. Filter widgets stay outside (above), since they
+        # need a normal full-script rerun on change and must run before this.
+        rq_index = review_queue.build_queue_index(rq_filt)
+        rq_pos = st.session_state.get("_queue_pos", 0)
 
-    if not rq_items:
-        st.success("Queue complete for this filter. 🎉")
-    else:
-        rq_pos = max(0, min(rq_pos, len(rq_items) - 1))
+        if not rq_index:
+            st.success("Queue complete for this filter. 🎉")
+            return
+
+        rq_pos = max(0, min(rq_pos, len(rq_index) - 1))
         st.session_state["_queue_pos"] = rq_pos
-        rq_item = rq_items[rq_pos]
+        rq_entry = rq_index[rq_pos]
 
-        st.progress((rq_pos + 1) / len(rq_items))
-        st.caption(f"**{rq_pos + 1} / {len(rq_items)}** in queue — "
+        # Reuse the previous render's prefetch if it's still the same entry
+        # (the common case: either "next" just advanced onto exactly what
+        # was prefetched, or nothing happened and we're re-showing the same
+        # item) -- avoids re-paying materialize()'s search_authority cost.
+        prefetch = st.session_state.get("_queue_prefetch")
+        if prefetch and prefetch.get("item_id") == rq_entry.item_id:
+            rq_item = prefetch["item"]
+        else:
+            rq_item = review_queue.materialize(rq_entry)
+
+        st.progress((rq_pos + 1) / len(rq_index))
+        st.caption(f"**{rq_pos + 1} / {len(rq_index)}** in queue — "
                    f"{_QUEUE_TYPE_LABELS[rq_item.item_type]}"
                    + (f" · vol{rq_item.volume:02d}" if rq_item.volume else ""))
 
@@ -701,15 +721,39 @@ with tab_review:
                             # This item stays in the live queue (nothing was
                             # decided) -- explicitly advance position, unlike
                             # every other action, where the acted-on item
-                            # drops out of build_queue()'s result on its own
-                            # and the same index naturally lands on the next
-                            # item for free.
+                            # drops out of build_queue_index()'s result on its
+                            # own and the same index naturally lands on the
+                            # next item for free. Prefetch survives (a
+                            # "next" is a pure no-op, nothing it could have
+                            # invalidated), so the item about to be shown is
+                            # already materialized.
                             st.session_state["_queue_pos"] = rq_pos + 1
                         else:
                             review_queue.apply_action(rq_item, rq_action.action)
                             st.toast(f"{rq_action.label.split(' (')[0]} — done.")
+                            # Unlike "next", a real action can change data the
+                            # prefetched next item's own materialization
+                            # depended on (e.g. a merge changing the
+                            # authority table) -- don't trust it, recompute
+                            # fresh next render.
+                            st.session_state["_queue_prefetch"] = None
                         st.rerun()
             hotkeys.bind_hotkeys(action_hotkeys)
+
+        # Prefetch the item one position ahead now, while nothing has been
+        # clicked yet -- by the time the user does click, the following
+        # render's materialize() cost is already paid.
+        if rq_pos + 1 < len(rq_index):
+            next_entry = rq_index[rq_pos + 1]
+            if not (prefetch and prefetch.get("item_id") == next_entry.item_id):
+                st.session_state["_queue_prefetch"] = {
+                    "item_id": next_entry.item_id,
+                    "item": review_queue.materialize(next_entry),
+                }
+        else:
+            st.session_state["_queue_prefetch"] = None
+
+    render_review_queue_fragment(rq_filt)
 
 
 # ── tab: charters ────────────────────────────────────────────────────────────

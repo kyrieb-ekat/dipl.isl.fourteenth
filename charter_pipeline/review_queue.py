@@ -8,6 +8,15 @@ keyboard-driven pass instead of switching between grid-based tabs.
 Every mutation here calls straight into an existing db.py function -- no new
 mutation codepaths, only new read/assembly logic on top of what the
 grid-based tabs already use.
+
+Two-phase build, not one: build_queue_index(filt) does the cheap SQL fetch
++ filter/sort for EVERY matching row, but stops short of the expensive part
+(materialize() below) -- for new_person/new_place specifically, that's a
+db.search_authority() fuzzy-match call per row, which at real data scale
+(thousands of pending rows) made every single render (i.e. every button
+click, since Streamlit reruns the whole script) do thousands of fuzzy
+matches for items nobody was even looking at. materialize(entry) does that
+expensive work for exactly the one entry about to be displayed.
 """
 from dataclasses import dataclass, field
 
@@ -53,21 +62,41 @@ class QueueItem:
 
 
 @dataclass
+class QueueIndexEntry:
+    """The cheap half of a QueueItem -- enough to list, filter, sort, and
+    count the queue without paying for the expensive part. materialize()
+    turns exactly one of these into a full QueueItem."""
+    item_id: str
+    item_type: str
+    volume: int | None
+    sort_score: float     # cheap-only: real score for person_dup/place_dup/review_item
+                            # (already a column on their row); 0.0 for new_person/new_place,
+                            # since a real value would require the deferred fuzzy match --
+                            # those two types fall back to their DB query's own
+                            # highest-confidence-first ORDER BY instead.
+    sort_name: str          # lowercased, for "name" sort -- cheap for every type
+    search_text: str        # lowercased raw fields this entry can be found by.
+                              # Full fidelity for person_dup/place_dup/review_item (their
+                              # subheader/diff text is already all raw row data, nothing
+                              # deferred). For new_person/new_place this is name/id only --
+                              # a real, minor, documented trade-off: search can no longer
+                              # match on the authority-match text (e.g. a score number)
+                              # since that isn't computed until materialize().
+    row: dict               # the already-fetched DB row; materialize() finishes the job
+
+
+@dataclass
 class QueueFilter:
     volumes: list | None = None                 # None = all volumes
     item_types: set = field(default_factory=lambda: set(ALL_ITEM_TYPES))
     search: str = ""
-    confidence: str | None = None                # dup candidates only
+    confidence: str | None = None                # currently unused -- no caller sets this;
+                                                    # kept on the dataclass in case a future caller
+                                                    # wants it, but build_queue_index doesn't filter
+                                                    # on it (doing so for new_person/new_place would
+                                                    # require materializing every row, defeating the
+                                                    # point of this module).
     sort: str = "default"                         # "default" | "score_desc" | "score_asc" | "name"
-
-
-def _matches_search(item: QueueItem, search: str) -> bool:
-    if not search.strip():
-        return True
-    needle = search.strip().lower()
-    haystack = " ".join([item.header, item.subheader] +
-                         [v for _, lv, rv in item.diff_rows for v in (lv, rv)]).lower()
-    return needle in haystack
 
 
 def _person_diff_rows(left: dict, right: dict | None) -> list:
@@ -127,224 +156,336 @@ def _merge_action(match: dict | None):
     return QueueAction("m", "merge", label, "primary" if high else "secondary")
 
 
-def _build_new_person_items(volumes: list | None) -> list:
-    items = []
+# ── new_person ────────────────────────────────────────────────────────────
+
+def _index_new_person_items(volumes: list | None) -> list:
+    entries = []
     df = db.get_persons(status="provisional", review_status="")
     if volumes:
         df = df[df["source_volume"].isin(volumes)]
-    for _, row in df.iterrows():
-        row = row.to_dict()
-        matches = db.search_authority("person", row["canonical_name"], limit=1)
-        match = matches[0] if matches else None
-        merge_action = _merge_action(match)
-        high_confidence = _is_high_confidence(match)
-
-        actions = []
-        if merge_action and high_confidence:
-            actions.append(merge_action)
-        actions += [
-            QueueAction("o", "ok", "OK (o)"),
-            QueueAction("a", "add", "Add to authority (a)", "primary"),
-            QueueAction("k", "skip", "Skip (k)"),
-        ]
-        if merge_action and not high_confidence:
-            actions.append(merge_action)
-        actions.append(QueueAction("n", "next", "Next / not sure yet (n)"))
-        items.append(QueueItem(
+    for row in df.to_dict("records"):
+        # Bulk to_dict("records") instead of .iterrows() + per-row .to_dict()
+        # -- ~3x faster at real data scale (measured: 0.66s -> 0.23s for
+        # person_dup's 15,862 rows), and this runs on every render since
+        # build_queue_index() is called fresh every time.
+        entries.append(QueueIndexEntry(
             item_id=f"new_person:{row['person_pk']}",
             item_type="new_person",
             volume=_to_int(row["source_volume"]),
-            header=f"{row['canonical_name']}  ({row['display_id']})",
-            subheader=_match_subheader(match),
-            left_label="New person", right_label="Authority match",
-            diff_rows=_person_diff_rows(row, match),
-            actions=actions,
-            payload={"pk": row["person_pk"], "match_pk": match["person_pk"] if match else None},
-            sort_score=match.get("_match_score", 0) if match else 0,
+            sort_score=0.0,
+            sort_name=(row["canonical_name"] or "").lower(),
+            search_text=f"{row['canonical_name']} {row['display_id']}".lower(),
+            row=row,
         ))
-    return items
+    return entries
 
 
-def _build_new_place_items(volumes: list | None) -> list:
-    items = []
+def _materialize_new_person(entry: QueueIndexEntry) -> QueueItem:
+    row = entry.row
+    matches = db.search_authority("person", row["canonical_name"], limit=1)
+    match = matches[0] if matches else None
+    merge_action = _merge_action(match)
+    high_confidence = _is_high_confidence(match)
+
+    actions = []
+    if merge_action and high_confidence:
+        actions.append(merge_action)
+    actions += [
+        QueueAction("o", "ok", "OK (o)"),
+        QueueAction("a", "add", "Add to authority (a)", "primary"),
+        QueueAction("k", "skip", "Skip (k)"),
+    ]
+    if merge_action and not high_confidence:
+        actions.append(merge_action)
+    actions.append(QueueAction("n", "next", "Next / not sure yet (n)"))
+    return QueueItem(
+        item_id=entry.item_id,
+        item_type="new_person",
+        volume=entry.volume,
+        header=f"{row['canonical_name']}  ({row['display_id']})",
+        subheader=_match_subheader(match),
+        left_label="New person", right_label="Authority match",
+        diff_rows=_person_diff_rows(row, match),
+        actions=actions,
+        payload={"pk": row["person_pk"], "match_pk": match["person_pk"] if match else None},
+        sort_score=match.get("_match_score", 0) if match else 0,
+    )
+
+
+# ── new_place ─────────────────────────────────────────────────────────────
+
+def _index_new_place_items(volumes: list | None) -> list:
+    entries = []
     df = db.get_places(status="provisional", review_status="")
     if volumes:
         df = df[df["source_volume"].isin(volumes)]
-    for _, row in df.iterrows():
-        row = row.to_dict()
-        matches = db.search_authority("place", row["canonical_name"], limit=1)
-        match = matches[0] if matches else None
-        merge_action = _merge_action(match)
-        high_confidence = _is_high_confidence(match)
-
-        actions = []
-        if merge_action and high_confidence:
-            actions.append(merge_action)
-        actions += [
-            QueueAction("o", "ok", "OK (o)"),
-            QueueAction("a", "add", "Add to authority (a)", "primary"),
-            QueueAction("k", "skip", "Skip (k)"),
-            QueueAction("x", "no_match", "No match / not a real place (x)"),
-        ]
-        if merge_action and not high_confidence:
-            actions.append(merge_action)
-        actions.append(QueueAction("n", "next", "Next / not sure yet (n)"))
-        items.append(QueueItem(
+    for row in df.to_dict("records"):
+        # Bulk to_dict("records") instead of .iterrows() + per-row .to_dict()
+        # -- ~3x faster at real data scale (measured: 0.66s -> 0.23s for
+        # person_dup's 15,862 rows), and this runs on every render since
+        # build_queue_index() is called fresh every time.
+        entries.append(QueueIndexEntry(
             item_id=f"new_place:{row['place_pk']}",
             item_type="new_place",
             volume=_to_int(row["source_volume"]),
-            header=f"{row['canonical_name']}  ({row['display_id']})",
-            subheader=_match_subheader(match),
-            left_label="New place", right_label="Authority match",
-            diff_rows=_place_diff_rows(row, match),
-            actions=actions,
-            payload={"pk": row["place_pk"], "match_pk": match["place_pk"] if match else None},
-            sort_score=match.get("_match_score", 0) if match else 0,
+            sort_score=0.0,
+            sort_name=(row["canonical_name"] or "").lower(),
+            search_text=f"{row['canonical_name']} {row['display_id']}".lower(),
+            row=row,
         ))
-    return items
+    return entries
 
 
-def _build_person_dup_items(volumes: list | None) -> list:
-    items = []
+def _materialize_new_place(entry: QueueIndexEntry) -> QueueItem:
+    row = entry.row
+    matches = db.search_authority("place", row["canonical_name"], limit=1)
+    match = matches[0] if matches else None
+    merge_action = _merge_action(match)
+    high_confidence = _is_high_confidence(match)
+
+    actions = []
+    if merge_action and high_confidence:
+        actions.append(merge_action)
+    actions += [
+        QueueAction("o", "ok", "OK (o)"),
+        QueueAction("a", "add", "Add to authority (a)", "primary"),
+        QueueAction("k", "skip", "Skip (k)"),
+        QueueAction("x", "no_match", "No match / not a real place (x)"),
+    ]
+    if merge_action and not high_confidence:
+        actions.append(merge_action)
+    actions.append(QueueAction("n", "next", "Next / not sure yet (n)"))
+    return QueueItem(
+        item_id=entry.item_id,
+        item_type="new_place",
+        volume=entry.volume,
+        header=f"{row['canonical_name']}  ({row['display_id']})",
+        subheader=_match_subheader(match),
+        left_label="New place", right_label="Authority match",
+        diff_rows=_place_diff_rows(row, match),
+        actions=actions,
+        payload={"pk": row["place_pk"], "match_pk": match["place_pk"] if match else None},
+        sort_score=match.get("_match_score", 0) if match else 0,
+    )
+
+
+# ── person_dup ────────────────────────────────────────────────────────────
+
+def _index_person_dup_items(volumes: list | None) -> list:
+    entries = []
     df = db.get_person_duplicate_candidates(decision="")
     if volumes:
         df = df[df["a_source"].isin([f"vol{v:02d}" for v in volumes]) |
                  df["b_source"].isin([f"vol{v:02d}" for v in volumes])]
-    for _, row in df.iterrows():
-        row = row.to_dict()
-        left = {"canonical_name": row["a_canonical_name"], "occupation": row["a_occupation"],
-                "title": row["a_title"], "floruit_start": row["a_floruit_start"],
-                "floruit_end": row["a_floruit_end"]}
-        right = {"canonical_name": row["b_canonical_name"], "occupation": row["b_occupation"],
-                 "title": row["b_title"], "floruit_start": row["b_floruit_start"],
-                 "floruit_end": row["b_floruit_end"]}
-        diff_rows = [
-            ("Name", blank(left["canonical_name"]), blank(right["canonical_name"])),
-            ("Source", row["a_source"], row["b_source"]),
-            ("Occupation", blank(left["occupation"]), blank(right["occupation"])),
-            ("Title", blank(left["title"]), blank(right["title"])),
-            ("Floruit", f"{blank(left['floruit_start'])} -- {blank(left['floruit_end'])}",
-                        f"{blank(right['floruit_start'])} -- {blank(right['floruit_end'])}"),
-        ]
-        items.append(QueueItem(
+    for row in df.to_dict("records"):
+        # Bulk to_dict("records") instead of .iterrows() + per-row .to_dict()
+        # -- ~3x faster at real data scale (measured: 0.66s -> 0.23s for
+        # person_dup's 15,862 rows), and this runs on every render since
+        # build_queue_index() is called fresh every time.
+        search_text = " ".join(str(row.get(k) or "") for k in (
+            "a_canonical_name", "a_display_id", "b_canonical_name", "b_display_id",
+            "a_source", "b_source", "a_occupation", "b_occupation", "a_title", "b_title",
+            "classification", "confidence",
+        )).lower()
+        entries.append(QueueIndexEntry(
             item_id=f"person_dup:{row['candidate_pk']}",
             item_type="person_dup",
             volume=None,
-            header=f"{row['a_canonical_name']}  ({row['a_display_id']})  vs.  "
-                   f"{row['b_canonical_name']}  ({row['b_display_id']})",
-            subheader=f"name_score={row['name_score']:.0f}  ·  dates={row['date_status']}  ·  "
-                      f"{row['classification']} ({row['confidence']})",
-            left_label=f"A · {row['a_display_id']}", right_label=f"B · {row['b_display_id']}",
-            diff_rows=diff_rows,
-            actions=[
-                QueueAction("s", "same", "Same — flag only (s)"),
-                QueueAction("m", "merge", "Same — merge now (m)", "primary"),
-                QueueAction("d", "different", "Different (d)"),
-                QueueAction("n", "next", "Next / not sure yet (n)"),
-            ],
-            payload={"candidate_pk": row["candidate_pk"], "person_a_pk": row["person_a_pk"],
-                     "person_b_pk": row["person_b_pk"]},
             sort_score=row["name_score"] or 0,
+            sort_name=f"{row['a_canonical_name']}  {row['b_canonical_name']}".lower(),
+            search_text=search_text,
+            row=row,
         ))
-    return items
+    return entries
 
 
-def _build_place_dup_items(volumes: list | None) -> list:
-    items = []
+def _materialize_person_dup(entry: QueueIndexEntry) -> QueueItem:
+    row = entry.row
+    left = {"canonical_name": row["a_canonical_name"], "occupation": row["a_occupation"],
+            "title": row["a_title"], "floruit_start": row["a_floruit_start"],
+            "floruit_end": row["a_floruit_end"]}
+    right = {"canonical_name": row["b_canonical_name"], "occupation": row["b_occupation"],
+             "title": row["b_title"], "floruit_start": row["b_floruit_start"],
+             "floruit_end": row["b_floruit_end"]}
+    diff_rows = [
+        ("Name", blank(left["canonical_name"]), blank(right["canonical_name"])),
+        ("Source", row["a_source"], row["b_source"]),
+        ("Occupation", blank(left["occupation"]), blank(right["occupation"])),
+        ("Title", blank(left["title"]), blank(right["title"])),
+        ("Floruit", f"{blank(left['floruit_start'])} -- {blank(left['floruit_end'])}",
+                    f"{blank(right['floruit_start'])} -- {blank(right['floruit_end'])}"),
+    ]
+    return QueueItem(
+        item_id=entry.item_id,
+        item_type="person_dup",
+        volume=None,
+        header=f"{row['a_canonical_name']}  ({row['a_display_id']})  vs.  "
+               f"{row['b_canonical_name']}  ({row['b_display_id']})",
+        subheader=f"name_score={row['name_score']:.0f}  ·  dates={row['date_status']}  ·  "
+                  f"{row['classification']} ({row['confidence']})",
+        left_label=f"A · {row['a_display_id']}", right_label=f"B · {row['b_display_id']}",
+        diff_rows=diff_rows,
+        actions=[
+            QueueAction("s", "same", "Same — flag only (s)"),
+            QueueAction("m", "merge", "Same — merge now (m)", "primary"),
+            QueueAction("d", "different", "Different (d)"),
+            QueueAction("n", "next", "Next / not sure yet (n)"),
+        ],
+        payload={"candidate_pk": row["candidate_pk"], "person_a_pk": row["person_a_pk"],
+                 "person_b_pk": row["person_b_pk"]},
+        sort_score=entry.sort_score,
+    )
+
+
+# ── place_dup ─────────────────────────────────────────────────────────────
+
+def _index_place_dup_items(volumes: list | None) -> list:
+    entries = []
     df = db.get_place_duplicate_candidates(decision="")
     if volumes:
         df = df[df["source_volume"].isin(volumes)]
-    for _, row in df.iterrows():
-        row = row.to_dict()
-        diff_rows = [
-            ("Name", blank(row.get("place_canonical_name") or row.get("di_name")), blank(row["candidate_name"])),
-            ("Type / sysla", blank(row["di_place_type"]), blank(row["candidate_sysla"])),
-            ("Region / hreppur", blank(row["di_region"]), blank(row["candidate_hreppur"])),
-            ("Coordinates", "", f"{blank(row['candidate_lat'])}, {blank(row['candidate_lng'])}"),
-        ]
-        items.append(QueueItem(
+    for row in df.to_dict("records"):
+        # Bulk to_dict("records") instead of .iterrows() + per-row .to_dict()
+        # -- ~3x faster at real data scale (measured: 0.66s -> 0.23s for
+        # person_dup's 15,862 rows), and this runs on every render since
+        # build_queue_index() is called fresh every time.
+        search_text = " ".join(str(row.get(k) or "") for k in (
+            "place_canonical_name", "di_name", "display_id", "candidate_name",
+            "di_place_type", "candidate_sysla", "di_region", "candidate_hreppur", "flag",
+        )).lower()
+        entries.append(QueueIndexEntry(
             item_id=f"place_dup:{row['candidate_pk']}",
             item_type="place_dup",
             volume=_to_int(row["source_volume"]),
-            header=f"{row['place_canonical_name']}  ({row['display_id']})  vs.  nafnid: {row['candidate_name']}",
-            subheader=f"name_score={row['name_score']:.1f}  ·  distance={blank(row['distance_km'])} km  ·  "
-                      f"flag={row['flag'] or 'none'}",
-            left_label="DI place", right_label="nafnid.is candidate",
-            diff_rows=diff_rows,
-            actions=[
-                QueueAction("s", "same", "Same (s)", "primary"),
-                QueueAction("d", "different", "Different (d)"),
-                QueueAction("n", "next", "Next / not sure yet (n)"),
-            ],
-            payload={"candidate_pk": row["candidate_pk"]},
             sort_score=row["name_score"] or 0,
+            sort_name=f"{row['place_canonical_name']}  {row['candidate_name']}".lower(),
+            search_text=search_text,
+            row=row,
         ))
-    return items
+    return entries
 
 
-def _build_review_items(volumes: list | None) -> list:
-    items = []
+def _materialize_place_dup(entry: QueueIndexEntry) -> QueueItem:
+    row = entry.row
+    diff_rows = [
+        ("Name", blank(row.get("place_canonical_name") or row.get("di_name")), blank(row["candidate_name"])),
+        ("Type / sysla", blank(row["di_place_type"]), blank(row["candidate_sysla"])),
+        ("Region / hreppur", blank(row["di_region"]), blank(row["candidate_hreppur"])),
+        ("Coordinates", "", f"{blank(row['candidate_lat'])}, {blank(row['candidate_lng'])}"),
+    ]
+    return QueueItem(
+        item_id=entry.item_id,
+        item_type="place_dup",
+        volume=entry.volume,
+        header=f"{row['place_canonical_name']}  ({row['display_id']})  vs.  nafnid: {row['candidate_name']}",
+        subheader=f"name_score={row['name_score']:.1f}  ·  distance={blank(row['distance_km'])} km  ·  "
+                  f"flag={row['flag'] or 'none'}",
+        left_label="DI place", right_label="nafnid.is candidate",
+        diff_rows=diff_rows,
+        actions=[
+            QueueAction("s", "same", "Same (s)", "primary"),
+            QueueAction("d", "different", "Different (d)"),
+            QueueAction("n", "next", "Next / not sure yet (n)"),
+        ],
+        payload={"candidate_pk": row["candidate_pk"]},
+        sort_score=entry.sort_score,
+    )
+
+
+# ── review_item ───────────────────────────────────────────────────────────
+
+def _index_review_items(volumes: list | None) -> list:
+    entries = []
     for vn in (volumes or db.get_volumes()):
         df = db.get_open_review_items(vn)
         df = df[df["decision"].fillna("") == ""]
-        for _, row in df.iterrows():
-            row = row.to_dict()
-            diff_rows = [
-                ("Extracted name", blank(row["extracted_name"]), blank(row["closest_match"])),
-                ("Role", blank(row["role_category"]), blank(row["role"])),
-                ("Score", "", blank(row["score"])),
-            ]
-            items.append(QueueItem(
+        for row in df.to_dict("records"):
+            row["_volume"] = vn
+            search_text = " ".join(str(row.get(k) or "") for k in (
+                "extracted_name", "closest_match", "role_category", "role", "entity_type",
+            )).lower()
+            entries.append(QueueIndexEntry(
                 item_id=f"review_item:{row['review_item_pk']}",
                 item_type="review_item",
                 volume=vn,
-                header=f"{row['extracted_name']}  ({row['entity_type']})",
-                subheader=f"Proposed match: {row['closest_match']}  (score {blank(row['score'])})",
-                left_label="Extracted", right_label="Proposed match",
-                diff_rows=diff_rows,
-                actions=[
-                    QueueAction("a", "accept", "Accept — use proposed match (a)", "primary"),
-                    QueueAction("r", "reject", "Reject — treat as new entity (r)"),
-                    QueueAction("n", "next", "Next / not sure yet (n)"),
-                ],
-                payload={"review_item_pk": row["review_item_pk"]},
                 sort_score=row["score"] or 0,
+                sort_name=(row["extracted_name"] or "").lower(),
+                search_text=search_text,
+                row=row,
             ))
-    return items
+    return entries
 
 
-_BUILDERS = {
-    "new_person": _build_new_person_items,
-    "new_place": _build_new_place_items,
-    "person_dup": _build_person_dup_items,
-    "place_dup": _build_place_dup_items,
-    "review_item": _build_review_items,
+def _materialize_review_item(entry: QueueIndexEntry) -> QueueItem:
+    row = entry.row
+    diff_rows = [
+        ("Extracted name", blank(row["extracted_name"]), blank(row["closest_match"])),
+        ("Role", blank(row["role_category"]), blank(row["role"])),
+        ("Score", "", blank(row["score"])),
+    ]
+    return QueueItem(
+        item_id=entry.item_id,
+        item_type="review_item",
+        volume=row["_volume"],
+        header=f"{row['extracted_name']}  ({row['entity_type']})",
+        subheader=f"Proposed match: {row['closest_match']}  (score {blank(row['score'])})",
+        left_label="Extracted", right_label="Proposed match",
+        diff_rows=diff_rows,
+        actions=[
+            QueueAction("a", "accept", "Accept — use proposed match (a)", "primary"),
+            QueueAction("r", "reject", "Reject — treat as new entity (r)"),
+            QueueAction("n", "next", "Next / not sure yet (n)"),
+        ],
+        payload={"review_item_pk": row["review_item_pk"]},
+        sort_score=entry.sort_score,
+    )
+
+
+_INDEX_BUILDERS = {
+    "new_person": _index_new_person_items,
+    "new_place": _index_new_place_items,
+    "person_dup": _index_person_dup_items,
+    "place_dup": _index_place_dup_items,
+    "review_item": _index_review_items,
+}
+
+_MATERIALIZERS = {
+    "new_person": _materialize_new_person,
+    "new_place": _materialize_new_place,
+    "person_dup": _materialize_person_dup,
+    "place_dup": _materialize_place_dup,
+    "review_item": _materialize_review_item,
 }
 
 
-def build_queue(filt: QueueFilter) -> list:
-    """Assembles the live, undecided-only queue for the given filter. Called
+def build_queue_index(filt: QueueFilter) -> list:
+    """Assembles the live, undecided-only queue for the given filter --
+    cheap SQL-only fetch + filter/sort, no per-row fuzzy matching. Called
     fresh on every render (cheap at this data scale, and the only way an
-    already-decided item reliably drops out immediately)."""
-    items = []
+    already-decided item reliably drops out immediately). Call materialize()
+    on exactly the entry you're about to display."""
+    entries = []
     for item_type in filt.item_types:
-        items.extend(_BUILDERS[item_type](filt.volumes))
+        entries.extend(_INDEX_BUILDERS[item_type](filt.volumes))
 
-    if filt.confidence:
-        items = [i for i in items if filt.confidence.lower() in i.subheader.lower()]
     if filt.search:
-        items = [i for i in items if _matches_search(i, filt.search)]
+        needle = filt.search.strip().lower()
+        entries = [e for e in entries if needle in e.search_text]
 
     if filt.sort == "score_desc":
-        items.sort(key=lambda i: i.sort_score, reverse=True)
+        entries.sort(key=lambda e: e.sort_score, reverse=True)
     elif filt.sort == "score_asc":
-        items.sort(key=lambda i: i.sort_score)
+        entries.sort(key=lambda e: e.sort_score)
     elif filt.sort == "name":
-        items.sort(key=lambda i: i.header.lower())
-    # "default": item-type groups in ALL_ITEM_TYPES iteration order, each
+        entries.sort(key=lambda e: e.sort_name)
+    # "default": item-type groups in filt.item_types iteration order, each
     # already sorted highest-confidence-first by its own db.py query.
 
-    return items
+    return entries
+
+
+def materialize(entry: QueueIndexEntry) -> QueueItem:
+    return _MATERIALIZERS[entry.item_type](entry)
 
 
 def apply_action(item: QueueItem, action_key: str) -> dict:

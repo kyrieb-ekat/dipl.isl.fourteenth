@@ -91,6 +91,41 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+# search_authority's canonical-table read used to run fresh on every single
+# call (a new connection + a full-table load + a rapidfuzz scan) -- fine in
+# isolation, but the Review tab used to call it once per pending row on every
+# render (thousands of calls/render at real data scale). A plain module-level
+# dict survives across Streamlit reruns for the life of the server process
+# (Streamlit doesn't reimport already-loaded modules), and is correctly
+# shared across browser sessions since the canonical table is global DB
+# state, not per-user -- so this is simpler than session_state and doesn't
+# need per-session invalidation either.
+_authority_cache: dict[str, pd.DataFrame] = {}
+
+
+def _load_canonical_df(entity_type: str) -> pd.DataFrame:
+    if entity_type not in _authority_cache:
+        table = "persons" if entity_type == "person" else "places"
+        conn = get_connection()
+        try:
+            _authority_cache[entity_type] = pd.read_sql_query(
+                f"SELECT * FROM {table} WHERE status = 'canonical'", conn)
+        finally:
+            conn.close()
+    return _authority_cache[entity_type]
+
+
+def invalidate_authority_cache(entity_type: str | None = None) -> None:
+    """Call after anything that can change a canonical persons/places row --
+    every write path that can is listed at each call site. Cheap (dict
+    clear), so call unconditionally rather than trying to detect whether the
+    touched row was actually canonical."""
+    if entity_type is None:
+        _authority_cache.clear()
+    else:
+        _authority_cache.pop(entity_type, None)
+
+
 def init_db(db_path: Path | None = None) -> None:
     """Applies schema.sql to a fresh (or existing, idempotent-if-empty) db file."""
     path = Path(db_path or DB_PATH)
@@ -178,6 +213,7 @@ def undo_last_action() -> dict:
     shutil.copy2(snap_path, DB_PATH)
     snap_path.unlink(missing_ok=True)
     _write_undo_log(entries)
+    invalidate_authority_cache()  # restores the whole DB file, bypasses every other mutator below
     return {"description": last["description"], "restored_at": _timestamp()}
 
 
@@ -329,6 +365,7 @@ def update_person(person_pk: int, **fields) -> None:
             )
     finally:
         conn.close()
+    invalidate_authority_cache("person")
 
 
 def _promote_persons_batch_impl(person_pks: list[int]) -> dict:
@@ -352,6 +389,7 @@ def _promote_persons_batch_impl(person_pks: list[int]) -> dict:
                 added.append(pk)
     finally:
         conn.close()
+    invalidate_authority_cache("person")
     return {"added": added, "skipped_existing": skipped_existing}
 
 
@@ -463,6 +501,7 @@ def _merge_persons_impl(survivor_pk: int, dropped_pks: list[int]) -> dict:
                 conn.execute("DELETE FROM persons WHERE person_pk = ?", (pk,))
     finally:
         conn.close()
+    invalidate_authority_cache("person")
     return {"survivor_pk": survivor_pk, "dropped_pks": dropped_pks}
 
 
@@ -614,6 +653,7 @@ def update_place(place_pk: int, **fields) -> None:
             )
     finally:
         conn.close()
+    invalidate_authority_cache("place")
 
 
 def update_place_geocoding(place_pk: int, coordinates_lat: float | None = None,
@@ -686,6 +726,7 @@ def _promote_places_batch_impl(place_pks: list[int]) -> dict:
                 added.append(pk)
     finally:
         conn.close()
+    invalidate_authority_cache("place")
     return {"added": added, "skipped_existing": skipped_existing}
 
 
@@ -748,6 +789,7 @@ def _merge_places_impl(survivor_pk: int, dropped_pks: list[int]) -> dict:
                 conn.execute("DELETE FROM places WHERE place_pk = ?", (pk,))
     finally:
         conn.close()
+    invalidate_authority_cache("place")
     return {"survivor_pk": survivor_pk, "dropped_pks": dropped_pks}
 
 
@@ -783,22 +825,17 @@ def search_authority(entity_type: str, name: str, limit: int = 3) -> list[dict]:
     Panel's New-Entities entry point (these rows have no precomputed
     candidate, unlike Review Queue/Final Review rows)."""
     from rapidfuzz import fuzz, process
-    conn = get_connection()
-    try:
-        table = "persons" if entity_type == "person" else "places"
-        df = pd.read_sql_query(f"SELECT * FROM {table} WHERE status = 'canonical'", conn)
-        if df.empty:
-            return []
-        names = df["canonical_name"].tolist()
-        matches = process.extract(name, names, scorer=fuzz.token_sort_ratio, limit=limit)
-        out = []
-        for matched_name, score, idx in matches:
-            row = df.iloc[idx].to_dict()
-            row["_match_score"] = score
-            out.append(row)
-        return out
-    finally:
-        conn.close()
+    df = _load_canonical_df(entity_type)
+    if df.empty:
+        return []
+    names = df["canonical_name"].tolist()
+    matches = process.extract(name, names, scorer=fuzz.token_sort_ratio, limit=limit)
+    out = []
+    for matched_name, score, idx in matches:
+        row = df.iloc[idx].to_dict()
+        row["_match_score"] = score
+        out.append(row)
+    return out
 
 
 def get_volumes() -> list[int]:
