@@ -10,6 +10,7 @@ population from those old sources.
 This module is imported directly (not digit-prefixed), same convention as
 config.py/person_authority.py/place_authority.py.
 """
+import os
 import re
 import shutil
 import sqlite3
@@ -23,8 +24,27 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config import DB_PATH
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
+# Defaults only. The undo functions resolve these from DB_PATH at call time
+# via _snapshot_dir()/_undo_log_path(), NOT from these constants.
+#
+# Anchoring the snapshot directory to the *code* location while DB_PATH is
+# env-overridable let the two diverge, and then with_undo() filed a snapshot of
+# database A into the undo stack of database B -- after which undo_last_action()
+# would shutil.copy2 that snapshot over whatever DB_PATH currently pointed at.
+# Observed for real: a scratch database's snapshot landed in the live
+# .snapshots/ as the newest entry, so one Undo click would have restored the
+# scratch DB over the live one. Snapshots must live beside the database they
+# are snapshots OF.
 SNAPSHOT_DIR = Path(__file__).parent / ".snapshots"
 UNDO_LOG_PATH = SNAPSHOT_DIR / "undo_log.json"
+
+
+def _snapshot_dir() -> Path:
+    return Path(DB_PATH).parent / ".snapshots"
+
+
+def _undo_log_path() -> Path:
+    return _snapshot_dir() / "undo_log.json"
 UNDO_STACK_SIZE = 20
 
 # Mirrors person_authority.py's/place_authority.py's identical _PAREN_TAIL +
@@ -126,6 +146,114 @@ def invalidate_authority_cache(entity_type: str | None = None) -> None:
         _authority_cache.pop(entity_type, None)
 
 
+REQUIRED_TABLES = (
+    "persons", "places", "charters", "charter_persons", "charter_places",
+    "review_queue_items", "person_duplicate_candidates", "place_duplicate_candidates",
+)
+
+
+def check_database(db_path: Path | None = None) -> str | None:
+    """Returns a human-readable problem description, or None if the database
+    looks usable. Never raises -- callers render the string.
+
+    Exists because `sqlite3.connect()` CREATES an empty file for a path that
+    doesn't exist. A wrong DB_PATH therefore doesn't fail at connect time; it
+    surfaces much later as `no such table: places` from somewhere deep in a
+    traceback, or -- worse -- as an app that renders perfectly and simply
+    shows no data, which is indistinguishable from "all the work is done".
+    A stale DB_PATH in the environment silently redirecting the whole app has
+    already happened once, so the message names the resolved path and the
+    override that most likely caused it.
+    """
+    path = Path(db_path or DB_PATH)
+    env_note = ""
+    if os.environ.get("DB_PATH"):
+        env_note = (f"\n\nDB_PATH is set in the environment "
+                    f"(`{os.environ['DB_PATH']}`), which overrides the default. "
+                    f"Unset it to use the database next to db.py.")
+    if not path.exists():
+        return f"No database file at `{path}`.{env_note}"
+    try:
+        conn = get_connection(path)
+        try:
+            have = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return f"Could not read `{path}`: {exc}{env_note}"
+    missing = [t for t in REQUIRED_TABLES if t not in have]
+    if missing:
+        empty = " (the file is empty -- SQLite created it on connect)" if not have else ""
+        return (f"`{path}` is not a charter_pipeline database{empty}: "
+                f"missing table(s) {', '.join(missing)}.{env_note}")
+    return None
+
+
+def get_funnel_counts() -> dict:
+    """One round-trip snapshot of where everything currently sits, for the
+    Dashboard. Answers "what is left and what should I do next" -- which
+    nothing in the app answered before, so the only way to judge remaining
+    work was to open each grid and read its row count.
+
+    Deliberately cheap: scalar aggregates over indexed columns, no joins over
+    the ~29k duplicate-candidate rows.
+    """
+    conn = get_connection()
+    try:
+        def n(sql, params=()):
+            return conn.execute(sql, params).fetchone()[0]
+
+        return {
+            "charters": n("SELECT COUNT(*) FROM charters"),
+            "charters_parse_error": n("SELECT COUNT(*) FROM charters WHERE has_parse_error = 1"),
+            "charters_flagged": n("SELECT COUNT(*) FROM charters "
+                                  "WHERE has_review_persons = 1 OR has_review_places = 1"),
+
+            "persons_total": n("SELECT COUNT(*) FROM persons"),
+            "persons_canonical": n("SELECT COUNT(*) FROM persons WHERE status = 'canonical'"),
+            "persons_unreviewed": n("SELECT COUNT(*) FROM persons "
+                                    "WHERE status = 'provisional' AND review_status = ''"),
+            "persons_accepted": n("SELECT COUNT(*) FROM persons "
+                                  "WHERE status = 'provisional' AND review_status = 'add'"),
+            "persons_flagged": n("SELECT COUNT(*) FROM persons WHERE data_quality_flag != ''"),
+
+            "places_total": n("SELECT COUNT(*) FROM places"),
+            "places_canonical": n("SELECT COUNT(*) FROM places WHERE status = 'canonical'"),
+            "places_unreviewed": n("SELECT COUNT(*) FROM places "
+                                   "WHERE status = 'provisional' AND review_status = ''"),
+            "places_accepted": n("SELECT COUNT(*) FROM places "
+                                 "WHERE status = 'provisional' AND review_status = 'add'"),
+            "places_geocoded": n("SELECT COUNT(*) FROM places WHERE coordinates_lat IS NOT NULL"),
+
+            "person_dups_open": n("SELECT COUNT(*) FROM person_duplicate_candidates "
+                                  "WHERE decision = ''"),
+            "person_dups_total": n("SELECT COUNT(*) FROM person_duplicate_candidates"),
+            "place_dups_open": n("SELECT COUNT(*) FROM place_duplicate_candidates "
+                                 "WHERE decision = ''"),
+            "place_dups_total": n("SELECT COUNT(*) FROM place_duplicate_candidates"),
+            "place_dups_confirmed": n("SELECT COUNT(*) FROM place_duplicate_candidates "
+                                      "WHERE decision = 'same'"),
+
+            "review_items_open": n("SELECT COUNT(*) FROM review_queue_items "
+                                   "WHERE status = 'open' AND decision = ''"),
+            "review_items_decided": n("SELECT COUNT(*) FROM review_queue_items "
+                                      "WHERE status = 'open' AND decision != ''"),
+            "review_items_resolved": n("SELECT COUNT(*) FROM review_queue_items "
+                                       "WHERE status = 'resolved'"),
+
+            # Places whose nafnid match is self-contradictory: more than one
+            # candidate confirmed 'same'. Mutually exclusive by construction,
+            # so these are real errors, not just pending work -- see
+            # record_place_duplicate_decision.
+            "places_contradictory": n(
+                """SELECT COUNT(*) FROM (SELECT place_pk FROM place_duplicate_candidates
+                   WHERE decision = 'same' GROUP BY place_pk HAVING COUNT(*) > 1)"""),
+        }
+    finally:
+        conn.close()
+
+
 def init_db(db_path: Path | None = None) -> None:
     """Applies schema.sql to a fresh (or existing, idempotent-if-empty) db file."""
     path = Path(db_path or DB_PATH)
@@ -155,15 +283,15 @@ def _timestamp() -> str:
 
 def _read_undo_log() -> list[dict]:
     import json
-    if not UNDO_LOG_PATH.exists():
+    if not _undo_log_path().exists():
         return []
-    return json.loads(UNDO_LOG_PATH.read_text(encoding="utf-8"))
+    return json.loads(_undo_log_path().read_text(encoding="utf-8"))
 
 
 def _write_undo_log(entries: list[dict]) -> None:
     import json
-    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-    UNDO_LOG_PATH.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+    _snapshot_dir().mkdir(parents=True, exist_ok=True)
+    _undo_log_path().write_text(json.dumps(entries, indent=2), encoding="utf-8")
 
 
 def with_undo(description: str, fn, *args, **kwargs):
@@ -171,9 +299,9 @@ def with_undo(description: str, fn, *args, **kwargs):
     snapshot + description in the undo journal on success, trims the journal
     to the last UNDO_STACK_SIZE entries. fn should perform its own commit/
     rollback (typically via a `with conn:` block)."""
-    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    _snapshot_dir().mkdir(parents=True, exist_ok=True)
     snap_name = f"{_timestamp()}__{_slugify(description)}.db"
-    snap_path = SNAPSHOT_DIR / snap_name
+    snap_path = _snapshot_dir() / snap_name
     if Path(DB_PATH).exists():
         shutil.copy2(DB_PATH, snap_path)
 
@@ -190,7 +318,7 @@ def with_undo(description: str, fn, *args, **kwargs):
 
     # Prune snapshot files no longer referenced by the trimmed journal.
     kept = {Path(e["snapshot_path"]).name for e in entries}
-    for f in SNAPSHOT_DIR.glob("*.db"):
+    for f in _snapshot_dir().glob("*.db"):
         if f.name not in kept:
             f.unlink(missing_ok=True)
 
@@ -448,6 +576,69 @@ def _merged_volumes_union(rows: list[dict]) -> str:
     return combined
 
 
+def _relink_person_duplicate_candidates(conn, survivor_pk: int, dropped_pks: list[int]) -> None:
+    """Repoints every duplicate-candidate edge from the merged-away persons
+    onto the survivor.
+
+    This can't be the obvious blanket UPDATE. person_duplicate_candidates
+    carries CHECK (person_a_pk < person_b_pk) and UNIQUE(person_a_pk,
+    person_b_pk), and a merge breaks both: merging the two sides of pair
+    (a, b) rewrites that row to (a, a), and any third person holding edges to
+    two members of the merge set collapses into two identical rows. Both were
+    live IntegrityErrors that rolled the whole merge back -- at the time this
+    was written 15,751 of the 15,862 candidate pairs shared a third person,
+    so the second case was the common one, not the corner.
+
+    Instead: drop edges that have become internal to the merged entity, and
+    collapse each remaining duplicate target to one row, keeping whichever
+    carries a human decision so a recorded judgement is never silently lost.
+    """
+    merge_set = {survivor_pk, *dropped_pks}
+    marks = ", ".join("?" for _ in merge_set)
+    rows = conn.execute(
+        f"""SELECT candidate_pk, person_a_pk, person_b_pk, decision, name_score
+            FROM person_duplicate_candidates
+            WHERE person_a_pk IN ({marks}) OR person_b_pk IN ({marks})""",
+        (*merge_set, *merge_set),
+    ).fetchall()
+
+    losers: list[int] = []
+    by_target: dict[tuple[int, int], list] = {}
+    for r in rows:
+        a = survivor_pk if r["person_a_pk"] in merge_set else r["person_a_pk"]
+        b = survivor_pk if r["person_b_pk"] in merge_set else r["person_b_pk"]
+        if a == b:
+            losers.append(r["candidate_pk"])  # now internal to one person
+            continue
+        by_target.setdefault((min(a, b), max(a, b)), []).append(r)
+
+    winners: list[tuple[int, int, int]] = []
+    for (a, b), group in by_target.items():
+        # decided rows first, then better score, then oldest -- so a reviewer's
+        # same/different verdict outranks an undecided duplicate of it.
+        group.sort(key=lambda r: (r["decision"] == "",
+                                  -(r["name_score"] or 0.0),
+                                  r["candidate_pk"]))
+        keep, rest = group[0], group[1:]
+        losers.extend(r["candidate_pk"] for r in rest)
+        if (keep["person_a_pk"], keep["person_b_pk"]) != (a, b):
+            winners.append((a, b, keep["candidate_pk"]))
+
+    # Delete first: the row currently occupying a winner's target slot may
+    # itself be a loser, and freeing the slot keeps UNIQUE satisfied mid-flight.
+    if losers:
+        conn.executemany(
+            "DELETE FROM person_duplicate_candidates WHERE candidate_pk = ?",
+            [(pk,) for pk in losers],
+        )
+    for a, b, candidate_pk in winners:
+        conn.execute(
+            "UPDATE person_duplicate_candidates SET person_a_pk=?, person_b_pk=? "
+            "WHERE candidate_pk = ?",
+            (a, b, candidate_pk),
+        )
+
+
 def _merge_persons_impl(survivor_pk: int, dropped_pks: list[int]) -> dict:
     conn = get_connection()
     try:
@@ -490,6 +681,10 @@ def _merge_persons_impl(survivor_pk: int, dropped_pks: list[int]) -> dict:
             # duplicate candidates) from the dropped ids to the survivor --
             # this is the operation merge_entities.py's file-based version
             # could only do within one volume; here it's global.
+            # Duplicate-candidate edges are relinked once for the whole merge
+            # set rather than per dropped pk -- the constraint handling needs
+            # to see every edge at once. See _relink_person_duplicate_candidates.
+            _relink_person_duplicate_candidates(conn, survivor_pk, dropped_pks)
             for pk in dropped_pks:
                 conn.execute("UPDATE charter_persons SET person_pk=? WHERE person_pk=?", (survivor_pk, pk))
                 conn.execute("UPDATE charter_persons SET review_match_person_pk=? WHERE review_match_person_pk=?",
@@ -498,14 +693,6 @@ def _merge_persons_impl(survivor_pk: int, dropped_pks: list[int]) -> dict:
                              (survivor_pk, pk))
                 conn.execute("UPDATE review_queue_items SET outcome_pk=? WHERE outcome_pk=? AND entity_type='person'",
                              (survivor_pk, pk))
-                conn.execute(
-                    "UPDATE person_duplicate_candidates SET person_a_pk=? WHERE person_a_pk=?",
-                    (survivor_pk, pk),
-                )
-                conn.execute(
-                    "UPDATE person_duplicate_candidates SET person_b_pk=? WHERE person_b_pk=?",
-                    (survivor_pk, pk),
-                )
                 conn.execute("DELETE FROM persons WHERE person_pk = ?", (pk,))
     finally:
         conn.close()
@@ -1326,41 +1513,115 @@ def get_place_duplicate_candidates(volume: int | None = None, decision: str | No
         conn.close()
 
 
+def _place_candidate_key(place_pk, nafnid, name) -> tuple:
+    """Natural identity of a nafnid candidate. There's no UNIQUE constraint on
+    the table to lean on, so the match is done in Python; nafnid alone would
+    be enough where it's populated, but it isn't always."""
+    return (place_pk, (nafnid or "").strip(), (name or "").strip().lower())
+
+
 def replace_place_duplicate_candidates(volume: int, rows: list[dict]) -> dict:
-    """Replaces every candidate row for the given volume's places (04a's
-    re-run behavior -- unlike persons, no confirmed-same signal exists for
-    places yet, so there's nothing to preserve across a re-run)."""
+    """Refreshes the nafnid candidates for one volume's places (04a re-run).
+
+    Decision-preserving, despite the name: a row someone has already ruled on
+    is never dropped or overwritten. The previous implementation deleted every
+    candidate row for the volume first, so the first 04a re-run after any
+    review silently erased all of it -- harmless when the docstring was
+    written (places had no decision column) but destructive since
+    `decision` was added and record_place_duplicate_decision started writing
+    it. Mirrors upsert_person_duplicate_candidates' guarantee.
+    """
     conn = get_connection()
+    inserted = updated = preserved = 0
     try:
         with conn:
-            conn.execute(
-                """DELETE FROM place_duplicate_candidates
+            existing = conn.execute(
+                """SELECT candidate_pk, place_pk, candidate_nafnid, candidate_name, decision
+                   FROM place_duplicate_candidates
                    WHERE place_pk IN (SELECT place_pk FROM places WHERE source_volume = ?)""",
                 (volume,),
-            )
+            ).fetchall()
+            by_key = {
+                _place_candidate_key(r["place_pk"], r["candidate_nafnid"], r["candidate_name"]): r
+                for r in existing
+            }
+
+            seen: set[tuple] = set()
             for r in rows:
-                conn.execute(
-                    """INSERT INTO place_duplicate_candidates
-                       (place_pk, di_name, di_sysla_given, di_place_type, di_region, wikidata_status,
-                        candidate_rank, name_score, distance_km, flag, match_sources, candidate_name,
-                        candidate_nafnid, candidate_hreppur, candidate_sysla, candidate_lat, candidate_lng)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (r["place_pk"], r.get("di_name", ""), r.get("di_sysla_given", ""),
-                     r.get("di_place_type", ""), r.get("di_region", ""), r.get("wikidata_status", ""),
-                     r.get("candidate_rank"), r.get("name_score"), r.get("distance_km"),
-                     r.get("flag", ""), r.get("match_sources", ""), r.get("candidate_name", ""),
-                     r.get("candidate_nafnid", ""), r.get("candidate_hreppur", ""),
-                     r.get("candidate_sysla", ""), r.get("candidate_lat"), r.get("candidate_lng")),
+                key = _place_candidate_key(
+                    r["place_pk"], r.get("candidate_nafnid", ""), r.get("candidate_name", ""))
+                seen.add(key)
+                prior = by_key.get(key)
+                if prior is not None and prior["decision"] != "":
+                    preserved += 1
+                    continue  # a human already ruled on this one
+                values = (
+                    r.get("di_name", ""), r.get("di_sysla_given", ""),
+                    r.get("di_place_type", ""), r.get("di_region", ""),
+                    r.get("wikidata_status", ""), r.get("candidate_rank"),
+                    r.get("name_score"), r.get("distance_km"), r.get("flag", ""),
+                    r.get("match_sources", ""), r.get("candidate_hreppur", ""),
+                    r.get("candidate_sysla", ""), r.get("candidate_lat"),
+                    r.get("candidate_lng"),
                 )
+                if prior is not None:
+                    conn.execute(
+                        """UPDATE place_duplicate_candidates SET
+                             di_name=?, di_sysla_given=?, di_place_type=?, di_region=?,
+                             wikidata_status=?, candidate_rank=?, name_score=?, distance_km=?,
+                             flag=?, match_sources=?, candidate_hreppur=?, candidate_sysla=?,
+                             candidate_lat=?, candidate_lng=?
+                           WHERE candidate_pk = ?""",
+                        (*values, prior["candidate_pk"]),
+                    )
+                    updated += 1
+                else:
+                    conn.execute(
+                        """INSERT INTO place_duplicate_candidates
+                           (place_pk, candidate_nafnid, candidate_name, di_name,
+                            di_sysla_given, di_place_type, di_region, wikidata_status,
+                            candidate_rank, name_score, distance_km, flag, match_sources,
+                            candidate_hreppur, candidate_sysla, candidate_lat, candidate_lng)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (r["place_pk"], r.get("candidate_nafnid", ""),
+                         r.get("candidate_name", ""), *values),
+                    )
+                    inserted += 1
+
+            # Undecided rows 04a no longer proposes are stale; decided ones stay.
+            stale = [r["candidate_pk"] for key, r in by_key.items()
+                     if key not in seen and r["decision"] == ""]
+            if stale:
+                conn.executemany(
+                    "DELETE FROM place_duplicate_candidates WHERE candidate_pk = ?",
+                    [(pk,) for pk in stale],
+                )
+            preserved += sum(1 for key, r in by_key.items()
+                             if key not in seen and r["decision"] != "")
     finally:
         conn.close()
-    return {"inserted": len(rows)}
+    return {"inserted": inserted, "updated": updated,
+            "preserved_decisions": preserved, "removed_stale": len(stale)}
 
 
 def record_place_duplicate_decision(candidate_pk: int, decision: str) -> None:
-    """On decision='same', backfills places.nafnid_id from this candidate's
-    candidate_nafnid if currently blank -- mirrors how a confirmed identity
-    match already propagates into wikidata_id elsewhere."""
+    """Records a same/different verdict on one nafnid candidate.
+
+    On decision='same' the match is actually *applied*, because 04a writes
+    N ranked candidates per place and only one of them can be right:
+
+    - places.nafnid_id is backfilled from candidate_nafnid (if blank),
+    - places.coordinates_lat/long are backfilled from candidate_lat/lng (if
+      blank). Without this a confirmed match produced no coordinates at all,
+      which is the entire point of the reconciliation -- 17 of 2,702 places
+      were geocoded while thousands of candidates sat waiting.
+    - the place's remaining undecided candidates are closed out as
+      'different'. They are mutually exclusive by construction, so leaving
+      them open both multiplies the queue ~5x and allows two contradictory
+      'same' verdicts on one place. An explicit decision someone already
+      recorded is never overwritten.
+    - the place is marked reviewed ('ok'), so it leaves the new-place queue.
+    """
     conn = get_connection()
     try:
         with conn:
@@ -1368,19 +1629,78 @@ def record_place_duplicate_decision(candidate_pk: int, decision: str) -> None:
                 "UPDATE place_duplicate_candidates SET decision=? WHERE candidate_pk = ?",
                 (decision, candidate_pk),
             )
-            if decision == "same":
-                cand = conn.execute(
-                    "SELECT place_pk, candidate_nafnid FROM place_duplicate_candidates WHERE candidate_pk = ?",
-                    (candidate_pk,),
-                ).fetchone()
-                if cand and cand["candidate_nafnid"]:
+            if decision != "same":
+                return
+            cand = conn.execute(
+                """SELECT place_pk, candidate_nafnid, candidate_lat, candidate_lng
+                   FROM place_duplicate_candidates WHERE candidate_pk = ?""",
+                (candidate_pk,),
+            ).fetchone()
+            if not cand:
+                return
+
+            if cand["candidate_nafnid"]:
+                conn.execute(
+                    """UPDATE places SET nafnid_id = ?, updated_at = datetime('now')
+                       WHERE place_pk = ? AND (nafnid_id = '' OR nafnid_id IS NULL)""",
+                    (cand["candidate_nafnid"], cand["place_pk"]),
+                )
+            # Only geocode when exactly one candidate is confirmed. Two 'same'
+            # verdicts on one place contradict each other, and picking either
+            # one's coordinates would be arbitrary rather than scholarly --
+            # real occurrence in this data: 'Mýrar' was confirmed against five
+            # different farms across five sýslur spanning ~250km, so whichever
+            # row happened to be written last would have decided where a
+            # fourteenth-century charter was located.
+            confirmed = conn.execute(
+                """SELECT candidate_lat, candidate_lng FROM place_duplicate_candidates
+                   WHERE place_pk = ? AND decision = 'same'""",
+                (cand["place_pk"],),
+            ).fetchall()
+
+            if len(confirmed) == 1:
+                if cand["candidate_lat"] is not None and cand["candidate_lng"] is not None:
                     conn.execute(
-                        """UPDATE places SET nafnid_id = ?, updated_at = datetime('now')
-                           WHERE place_pk = ? AND (nafnid_id = '' OR nafnid_id IS NULL)""",
-                        (cand["candidate_nafnid"], cand["place_pk"]),
+                        """UPDATE places
+                           SET coordinates_lat = ?, coordinates_long = ?,
+                               updated_at = datetime('now')
+                           WHERE place_pk = ? AND coordinates_lat IS NULL""",
+                        (cand["candidate_lat"], cand["candidate_lng"], cand["place_pk"]),
                     )
+            else:
+                # A contradiction has just appeared. Retract coordinates that
+                # came from one of the now-contested candidates -- but only
+                # those: coordinates from 04_lookup_coords.py (Wikidata) are
+                # independent evidence and must survive.
+                place_row = conn.execute(
+                    "SELECT coordinates_lat, coordinates_long FROM places WHERE place_pk = ?",
+                    (cand["place_pk"],),
+                ).fetchone()
+                from_a_contested_candidate = any(
+                    r["candidate_lat"] == place_row["coordinates_lat"]
+                    and r["candidate_lng"] == place_row["coordinates_long"]
+                    for r in confirmed
+                )
+                if place_row["coordinates_lat"] is not None and from_a_contested_candidate:
+                    conn.execute(
+                        """UPDATE places SET coordinates_lat = NULL, coordinates_long = NULL,
+                               updated_at = datetime('now')
+                           WHERE place_pk = ?""",
+                        (cand["place_pk"],),
+                    )
+            conn.execute(
+                """UPDATE place_duplicate_candidates SET decision = 'different'
+                   WHERE place_pk = ? AND candidate_pk != ? AND decision = ''""",
+                (cand["place_pk"], candidate_pk),
+            )
+            conn.execute(
+                """UPDATE places SET review_status = 'ok', updated_at = datetime('now')
+                   WHERE place_pk = ? AND review_status = ''""",
+                (cand["place_pk"],),
+            )
     finally:
         conn.close()
+    invalidate_authority_cache("place")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -1,0 +1,7 @@
+# Development/test dependencies, on top of requirements.txt.
+#   .venv/bin/python -m pip install -r requirements-dev.txt
+#   .venv/bin/python -m pytest tests/
+#
+# tests/ builds its databases from schema.sql, or from a Connection.backup()
+# copy of charter_pipeline.db -- it never opens the real database for writing.
+pytest>=8.0.0

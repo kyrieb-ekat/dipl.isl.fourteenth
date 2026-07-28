@@ -1,6 +1,7 @@
 .env
 __pycache__/
 *.pyc
+.pytest_cache/
 .DS_Store
 charter_pipeline/output/
 charter_pipeline/.venv/
