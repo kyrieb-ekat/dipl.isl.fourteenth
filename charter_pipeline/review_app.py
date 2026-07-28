@@ -19,9 +19,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 import config
 import db
 import diff_render
-import hotkeys
 import review_queue
+import ui.dashboard as ui_dashboard
 import ui_widgets
+from ui.cards import render_item_card, sanitized_key  # noqa: F401
 
 PYTHON = sys.executable
 SCRIPTS = Path(__file__).parent
@@ -29,194 +30,25 @@ SCRIPTS = Path(__file__).parent
 st.set_page_config(page_title="DI Authority Review", layout="wide")
 st.markdown(diff_render.DIFF_CSS, unsafe_allow_html=True)
 
-
-# ── generic data/UI helpers ─────────────────────────────────────────────────
-#
-# No hand-rolled full-dataframe cache: every tab fetches fresh from db.py on
-# every render (cheap, indexed SQL reads -- the old CSV-parsing cost that
-# justified a persistent cache doesn't apply here). What IS still needed:
-# (a) a per-session "last known saved state" snapshot so unsaved in-widget
-# edits are never silently discarded/overwritten by a rerun, and (b) a
-# widget-key version counter so st.data_editor remounts cleanly after a
-# mutation changes the underlying rows out from under it. Both are
-# namespaced by the same mergever epoch, so bumping one always invalidates
-# the other in lockstep -- eliminates the old app's one confirmed
-# cache-invalidation bug (a missed pop() in one call site).
+# Fail loudly on a wrong/empty database rather than rendering an app that
+# looks fine and shows nothing -- sqlite3.connect() creates an empty file for
+# a path that doesn't exist, so this is a real and already-observed failure.
+_db_problem = db.check_database()
+if _db_problem:
+    st.error(f"**Database problem.** {_db_problem}")
+    st.caption("Fix the path, then reload. Nothing has been read or written.")
+    st.stop()
 
 
-def bump(*keys: str) -> None:
-    for k in keys:
-        st.session_state[f"_mergever_{k}"] = st.session_state.get(f"_mergever_{k}", 0) + 1
-
-
-def mergever(key: str) -> int:
-    return st.session_state.get(f"_mergever_{key}", 0)
-
-
-def snap_key(session_key: str) -> str:
-    return f"_snap_{session_key}_{mergever(session_key)}"
-
-
-def ensure_snapshot(session_key: str, df: pd.DataFrame) -> None:
-    k = snap_key(session_key)
-    if k not in st.session_state:
-        st.session_state[k] = df.copy()
-
-
-def is_dirty(session_key: str, edited: pd.DataFrame) -> bool:
-    snap = st.session_state.get(snap_key(session_key))
-    return snap is None or not edited.reset_index(drop=True).equals(snap.reset_index(drop=True))
-
-
-def mark_saved(session_key: str, edited: pd.DataFrame) -> None:
-    st.session_state[snap_key(session_key)] = edited.copy()
-
-
-def reset_snapshot_on_filter_change(session_key: str, filter_sig) -> None:
-    """The dirty-check snapshot (ensure_snapshot/is_dirty) assumes the
-    underlying row set for session_key only changes when mergever bumps --
-    true before the filter toolbar existed, since every tab showed its whole
-    dataframe. Now that a filter toolbar can change which rows are visible on
-    an otherwise-ordinary rerun (no save, no bump), a stale snapshot from
-    before the filter changed would otherwise make is_dirty() spuriously
-    report unsaved changes (or worse, silently ignore edits to rows the old
-    snapshot never saw). Call this once, right after computing filter_sig and
-    before ensure_snapshot, to bump() the moment the filter itself changes."""
-    sig_key = f"_filtsig_{session_key}"
-    if st.session_state.get(sig_key) != filter_sig:
-        st.session_state[sig_key] = filter_sig
-        bump(session_key)
-
-
-def reset_snapshot_on_rowset_change(session_key: str, pks) -> None:
-    """Same purpose as reset_snapshot_on_filter_change, but for a different
-    trigger: the underlying row set can now also change for a reason
-    entirely outside this tab's own bump() calls -- the Review tab mutates
-    the exact same underlying tables (persons/places/duplicate-candidates/
-    review_queue_items) via its own, separate action codepath, with no
-    reason to know this tab's session_key exists. Call this with the FULL
-    (pre-filter) set of pks for session_key, once per render, right
-    alongside reset_snapshot_on_filter_change -- if the actual row set
-    differs from last render for ANY reason, bump immediately, before the
-    grid renders, so st.data_editor never gets a stale key paired with
-    reshaped data (which is what was silently dropping pending edits/
-    selections)."""
-    fp = tuple(sorted(pks))
-    key = f"_rowset_{session_key}"
-    if st.session_state.get(key) != fp:
-        st.session_state[key] = fp
-        bump(session_key)
-
-
-def apply_row_diffs(before_df: pd.DataFrame, after_df: pd.DataFrame, id_col: str,
-                     update_fn, editable_cols: list[str]) -> int:
-    """For every row where any editable_cols value differs between before_df
-    and after_df (matched by id_col), calls update_fn(id_value, **changes).
-    Returns the number of rows updated."""
-    if before_df.empty:
-        return 0
-    before_by_id = before_df.set_index(id_col)
-    n = 0
-    for _, row in after_df.iterrows():
-        rid = row[id_col]
-        if rid not in before_by_id.index:
-            continue
-        brow = before_by_id.loc[rid]
-        changes = {c: row[c] for c in editable_cols
-                   if c in brow.index and str(row[c]) != str(brow[c])}
-        if changes:
-            update_fn(rid, **changes)
-            n += 1
-    return n
-
-
-def save_button(session_key: str, edited: pd.DataFrame, apply_fn, label: str = "Save changes") -> None:
-    """apply_fn(edited_df) -> int (rows changed): persists pending edits.
-    Disabled while there's nothing to save."""
-    dirty = is_dirty(session_key, edited)
-    col_btn, col_status = st.columns([1, 5])
-    with col_btn:
-        if st.button(label, key=f"save_{session_key}", disabled=not dirty,
-                     type="primary" if dirty else "secondary"):
-            n = apply_fn(edited)
-            mark_saved(session_key, edited)
-            bump(session_key)
-            st.toast(f"Saved ({n} row(s) changed).")
-            st.rerun()
-    with col_status:
-        if dirty:
-            st.warning("Unsaved changes — click **Save changes** to write them.")
-        else:
-            st.caption("All changes saved.")
-
-
-def with_wikidata_links(df: pd.DataFrame, id_col: str = "wikidata_id") -> pd.DataFrame:
-    out = df.copy()
-    out["wikidata_link"] = out[id_col].fillna("").apply(
-        lambda q: f"https://www.wikidata.org/wiki/{q}" if str(q).strip() else ""
-    )
-    return out
-
-
-def with_checkbox(df: pd.DataFrame, session_key: str, pk_col: str, col_name: str = "select") -> pd.DataFrame:
-    """Seeds the select column from a session-state-backed set of checked pks
-    instead of a hardcoded False -- unlike a bare data_editor checkbox column
-    (whose checked state lives only in the widget's own ephemeral state), this
-    set survives the bump()-triggered widget-key remount every Save button
-    causes, so checking rows then saving unrelated edits no longer silently
-    clears the selection. Call sync_checked_pks() right after the matching
-    st.data_editor call to keep the set in sync with in-grid clicks."""
-    checked = st.session_state.setdefault(f"_checked_pks_{session_key}", set())
-    out = df.copy()
-    out.insert(0, col_name, out[pk_col].isin(checked) if pk_col in out.columns else False)
-    return out
-
-
-def sync_checked_pks(session_key: str, edited_df: pd.DataFrame, pk_col: str, col_name: str = "select") -> None:
-    """Call immediately after the st.data_editor call that used with_checkbox,
-    before any bump() -- persists whatever's currently checked in the grid
-    into the session-state set with_checkbox() reads from on the next render."""
-    st.session_state[f"_checked_pks_{session_key}"] = set(
-        edited_df.loc[edited_df[col_name] == True, pk_col].tolist())  # noqa: E712
-
-
-def blank_if_null(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    """DataFrame-sourced nullable numeric columns come back as float64 NaN --
-    render them as '' in editable text columns rather than the literal
-    string 'nan' (same pitfall fixed in person_authority.py/place_authority.py)."""
-    out = df.copy()
-    for c in cols:
-        if c in out.columns:
-            out[c] = out[c].apply(lambda v: "" if pd.isna(v) else
-                                   (str(int(v)) if float(v).is_integer() else str(v)))
-    return out
-
-
-# ── undo control (rendered on every tab, per plan section 2.5) ─────────────
-
-
-def undo_widget(location_key: str) -> None:
-    last = db.get_last_action()
-    if not last:
-        return
-    confirm_key = f"_undo_confirm_{location_key}"
-    col1, col2 = st.columns([1, 5])
-    with col1:
-        if not st.session_state.get(confirm_key):
-            if st.button("↩ Undo", key=f"undo_btn_{location_key}"):
-                st.session_state[confirm_key] = True
-                st.rerun()
-        else:
-            if st.button("Confirm undo", key=f"undo_confirm_{location_key}", type="primary"):
-                result = db.undo_last_action()
-                st.session_state[confirm_key] = False
-                st.toast(f"Undone: {result['description']}")
-                st.rerun()
-    with col2:
-        if st.session_state.get(confirm_key):
-            st.warning(f"Undo **{last['description']}**? (This is itself only reversible by another undo.)")
-        else:
-            st.caption(f"Last action: _{last['description']}_")
+# Shared per-session UI state + grid helpers now live in ui/state.py so page
+# modules can use them without importing this entrypoint. Imported by name
+# rather than as a module so the existing call sites below read unchanged.
+from ui.state import (  # noqa: E402
+    apply_row_diffs, blank_if_null, bump, ensure_snapshot, is_dirty, mark_saved,
+    mergever, reset_snapshot_on_filter_change, reset_snapshot_on_rowset_change,
+    save_button, snap_key, sync_checked_pks, undo_widget, with_checkbox,
+    with_wikidata_links,
+)
 
 
 # ── pipeline subprocess helpers (unchanged from before the migration) ──────
@@ -298,17 +130,15 @@ else:
     st.sidebar.caption("No volumes in the database yet. Run Step 1 in the Pipeline tab to create one.")
 
 st.sidebar.markdown("---")
-st.sidebar.caption(f"Database: `{Path(config.DB_PATH).name}`")
+# db.DB_PATH, not config.DB_PATH: db.py is what every query actually opens,
+# so this caption should report the database in use rather than a second,
+# independently-resolved copy of the same setting.
+st.sidebar.caption(f"Database: `{Path(db.DB_PATH).name}`")
 st.sidebar.caption(
     "Person Duplicates, Place Duplicates, and Final Review are cross-volume — "
     "the Volume selector above does not filter those tabs."
 )
 
-(tab_pipeline, tab_review, tab_charters, tab_queue, tab_entities, tab_dupes,
- tab_place_dupes, tab_final, tab_authority) = st.tabs(
-    ["Pipeline", "Review", "Charters", "Review Queue", "New Entities",
-     "Person Duplicates", "Place Duplicates", "Final Review", "Authority Browser"]
-)
 
 
 # ── tab: pipeline ────────────────────────────────────────────────────────────
@@ -627,7 +457,7 @@ def render_pipeline_tab():
         st.rerun()
 
 
-with tab_pipeline:
+def page_pipeline():
     render_pipeline_tab()
 
 
@@ -646,49 +476,7 @@ _QUEUE_TYPE_LABELS = {
 }
 
 
-def _render_item_card(rq_item, on_action=None) -> None:
-    """Renders one item's header/diff-table/action-buttons + wires up
-    hotkeys -- shared by both Review-tab view modes (single-card sequential,
-    and List+detail) so they render identically. Calls apply_action() for
-    any non-"next" click, then on_action(action_key) if given (the two
-    modes advance/reset differently after an action -- single-card moves a
-    position counter, List+detail just lets its own row-set-changed check
-    remount the list -- so that's left to the caller), then st.rerun().
-
-    Widget key is the action name ALONE (stable across items/reruns), not
-    item_id -- item_id contains a literal ":" (e.g. "new_place:157"),
-    invalid inside the CSS class selector hotkeys.bind_hotkeys builds from
-    it. One bind_hotkeys() call per render (not one per button) keeps this
-    to a single extra invisible iframe -- with one iframe per button (an
-    earlier attempt using the third-party streamlit-shortcuts package),
-    keyboard focus intermittently got captured by one of the many 0-height
-    iframes and real keydown events then never reached the page-level
-    listener at all."""
-    with st.container(border=True):
-        st.markdown(f"#### {rq_item.header}")
-        st.caption(rq_item.subheader)
-        diff_render.render_diff_table(rq_item.diff_rows, rq_item.left_label, rq_item.right_label)
-
-        btn_cols = st.columns(len(rq_item.actions))
-        action_hotkeys = {}
-        for col, rq_action in zip(btn_cols, rq_item.actions):
-            with col:
-                clicked = st.button(
-                    rq_action.label, key=f"rq_act_{rq_action.action}",
-                    type="primary" if rq_action.style == "primary" else "secondary",
-                )
-                action_hotkeys[f"rq_act_{rq_action.action}"] = rq_action.hotkey
-                if clicked:
-                    if rq_action.action != "next":
-                        review_queue.apply_action(rq_item, rq_action.action)
-                        st.toast(f"{rq_action.label.split(' (')[0]} — done.")
-                    if on_action:
-                        on_action(rq_action.action)
-                    st.rerun()
-        hotkeys.bind_hotkeys(action_hotkeys)
-
-
-with tab_review:
+def page_review():
     undo_widget("review")
     st.caption(
         "Works through every pending decision -- new entities, person/place "
@@ -785,7 +573,7 @@ with tab_review:
                 # it, recompute fresh next render.
                 st.session_state["_queue_prefetch"] = None
 
-        _render_item_card(rq_item, on_action=_advance)
+        render_item_card(rq_item, on_action=_advance, key_prefix="rq_card")
 
         # Prefetch the item one position ahead now, while nothing has been
         # clicked yet -- by the time the user does click, the following
@@ -850,7 +638,7 @@ with tab_review:
 
         if len(selected_entries) == 1:
             rq_item = review_queue.materialize(selected_entries[0])
-            _render_item_card(rq_item)
+            render_item_card(rq_item, key_prefix="rq_listdetail")
             return
 
         # 2+ selected: lightweight summary only, no materialize() calls.
@@ -882,7 +670,7 @@ with tab_review:
 
 # ── tab: charters ────────────────────────────────────────────────────────────
 
-with tab_charters:
+def page_charters():
     undo_widget("charters")
     flagged_only = st.checkbox("Flagged only", value=True, key="charters_flagged_only")
     ckey = f"{vol}_charters"
@@ -980,7 +768,7 @@ with tab_charters:
 
 # ── tab: review queue ────────────────────────────────────────────────────────
 
-with tab_queue:
+def page_queue():
     undo_widget("queue")
     sub_pending, sub_resolved = st.tabs(["Pending", "Resolved"])
 
@@ -1092,7 +880,7 @@ with tab_queue:
 
 # ── tab: new entities ────────────────────────────────────────────────────────
 
-with tab_entities:
+def page_entities():
     undo_widget("entities")
     sub_p, sub_pl = st.tabs(["Persons", "Places"])
 
@@ -1314,7 +1102,7 @@ with tab_entities:
 
 # ── tab: person duplicates ─────────────────────────────────────────────────
 
-with tab_dupes:
+def page_person_dupes():
     undo_widget("person_dupes")
     st.caption(
         "Compares every provisional person across all volumes against each other and "
@@ -1436,7 +1224,7 @@ with tab_dupes:
 
 # ── tab: place duplicates ────────────────────────────────────────────────────
 
-with tab_place_dupes:
+def page_place_dupes():
     undo_widget("place_dupes")
     st.caption(
         "Candidates from nafnid.is (Árnastofnun) reconciliation (Step 4a). No confirmed-'same' "
@@ -1516,7 +1304,7 @@ with tab_place_dupes:
 
 # ── tab: final review ────────────────────────────────────────────────────────
 
-with tab_final:
+def page_final():
     undo_widget("final")
     all_volumes = db.get_volumes()
     rows = db.get_final_review_candidates(all_volumes) if all_volumes else []
@@ -1581,7 +1369,7 @@ with tab_final:
 
 # ── tab: authority browser ─────────────────────────────────────────────────
 
-with tab_authority:
+def page_authority():
     tb_auth = ui_widgets.render_filter_toolbar("authority")
     auth_pl_tab, auth_pe_tab = st.tabs(["Places", "Persons"])
 
@@ -1610,3 +1398,83 @@ with tab_authority:
             use_container_width=True, hide_index=True,
             column_config={"wikidata_link": st.column_config.LinkColumn("Wikidata")},
         )
+
+# ── page: browse (one table at a time) ───────────────────────────────────────
+#
+# The five grid screens were five sibling tabs, named after the SQL tables they
+# read rather than after any task. Grouped here behind a single selector so
+# exactly ONE renders per run -- st.tabs() would put all five in the DOM
+# simultaneously, which is the cost this whole restructure exists to remove.
+
+BROWSE_TABLES = {
+    "New entities": page_entities,
+    "Review queue": page_queue,
+    "Person duplicates": page_person_dupes,
+    "Place duplicates": page_place_dupes,
+    "Authority file": page_authority,
+}
+
+
+def page_browse():
+    st.caption(
+        "Bulk field edits, sorting and search across the raw tables. The "
+        "one-decision-at-a-time flow lives on the **Review** page."
+    )
+    choice = st.radio("Table", list(BROWSE_TABLES), horizontal=True,
+                      key="_browse_table", label_visibility="collapsed")
+    st.markdown("---")
+    BROWSE_TABLES[choice]()
+
+
+def page_dashboard():
+    ui_dashboard.render(goto=_goto)
+
+
+# ── navigation ───────────────────────────────────────────────────────────────
+#
+# st.navigation instead of st.tabs: only the selected page's function runs, so
+# a click no longer pays to re-render every other screen. Measured before this
+# change: 17 tab panels and 99 buttons in the DOM at once, 74 of them
+# invisible. That render-everything behaviour was the direct cause of three
+# separate fixed bugs (~20s Review-tab latency, the hotkey leak firing buttons
+# on hidden tabs, and cross-tab loss of grid selections), and it is also why
+# hotkeys.py needs an offsetParent visibility guard at all.
+#
+# Pages are callables rather than separate script files so the page bodies
+# could move here unchanged; a `pages/` DIRECTORY would additionally trigger
+# Streamlit's own automatic navigation and compete with this registry.
+
+# Placeholder for the Phase 2/4 role split: guests will be propose-only and
+# must not reach Pipeline (it shells out to the numbered scripts and spends
+# Anthropic API credits) or Promote (promotion is ratification).
+IS_OWNER = True
+
+_PAGE_KEYS = {
+    # No url_path: Streamlit serves the DEFAULT page at "/", so declaring one
+    # advertises a /dashboard link that resolves to "Page not found".
+    "dashboard": st.Page(page_dashboard, title="Dashboard", icon=":material/dashboard:",
+                         default=True),
+    "review": st.Page(page_review, title="Review", icon=":material/fact_check:",
+                      url_path="review"),
+    "charters": st.Page(page_charters, title="Charters", icon=":material/description:",
+                        url_path="charters"),
+    "browse": st.Page(page_browse, title="Browse", icon=":material/table_rows:",
+                      url_path="browse"),
+    "promote": st.Page(page_final, title="Promote", icon=":material/publish:",
+                       url_path="promote"),
+    "pipeline": st.Page(page_pipeline, title="Pipeline", icon=":material/terminal:",
+                        url_path="pipeline"),
+}
+
+
+def _goto(page_key: str) -> None:
+    """Used by the Dashboard's start-here button."""
+    st.switch_page(_PAGE_KEYS[page_key])
+
+
+_sections = {"Work": [_PAGE_KEYS["dashboard"], _PAGE_KEYS["review"],
+                      _PAGE_KEYS["charters"], _PAGE_KEYS["browse"]]}
+if IS_OWNER:
+    _sections["Owner"] = [_PAGE_KEYS["promote"], _PAGE_KEYS["pipeline"]]
+
+st.navigation(_sections).run()
