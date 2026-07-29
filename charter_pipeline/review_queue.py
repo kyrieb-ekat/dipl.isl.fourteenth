@@ -407,7 +407,10 @@ def _materialize_place_dup(entry: QueueIndexEntry) -> QueueItem:
             QueueAction("d", "different", "Different (d)"),
             QueueAction("n", "next", "Next / not sure yet (n)"),
         ],
-        payload={"candidate_pk": row["candidate_pk"]},
+        # place_pk so the evidence panes can show which charters attest this
+        # place; the other side of this comparison is an external nafnid.is
+        # record and has no charter evidence by definition.
+        payload={"candidate_pk": row["candidate_pk"], "place_pk": row["place_pk"]},
         sort_score=entry.sort_score,
     )
 
@@ -457,7 +460,13 @@ def _materialize_review_item(entry: QueueIndexEntry) -> QueueItem:
             QueueAction("r", "reject", "Reject — treat as new entity (r)"),
             QueueAction("n", "next", "Next / not sure yet (n)"),
         ],
-        payload={"review_item_pk": row["review_item_pk"]},
+        # charter_pk/match_pk/entity_type so the evidence panes can show the
+        # charter this mention actually sits in, plus the proposed match's own
+        # attestations.
+        payload={"review_item_pk": row["review_item_pk"],
+                 "charter_pk": row["charter_pk"],
+                 "match_pk": row["match_pk"],
+                 "entity_type": row["entity_type"]},
         sort_score=entry.sort_score,
     )
 

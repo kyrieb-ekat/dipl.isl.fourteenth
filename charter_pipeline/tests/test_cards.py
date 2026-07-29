@@ -23,9 +23,18 @@ CARD_SCRIPT = textwrap.dedent("""
     from pathlib import Path
     sys.path.insert(0, {pkg!r})
 
+    import functools
     import streamlit as st
     from review_queue import QueueAction, QueueItem
-    from ui.cards import render_item_card
+    import ui.cards
+
+    # Evidence off for these tests. They exercise widget-key and hotkey
+    # mechanics with synthetic pks; leaving evidence on made them query the
+    # real database (there is no DB fixture here) and the composite check
+    # then fired for pks that happen to be real composites -- p003, p006 --
+    # adding buttons and making the assertions depend on live data.
+    render_item_card = functools.partial(ui.cards.render_item_card,
+                                         show_evidence=False)
 
     def make_item(n):
         return QueueItem(
@@ -37,7 +46,7 @@ CARD_SCRIPT = textwrap.dedent("""
                 QueueAction(hotkey="a", action="add", label="Add (a)", style="primary"),
                 QueueAction(hotkey="s", action="skip", label="Skip (s)"),
             ],
-            payload={{"person_pk": n}},
+            payload={{"pk": n, "match_pk": None}},
         )
 
     {body}
