@@ -95,11 +95,18 @@ def seed():
         def _conn(self):
             return db_module.get_connection()
 
+        def _prefix(self, volume, kind):
+            # volume=None models an authority-file import, whose display_id has
+            # no volume segment (p012, l004) -- that's also the only shape with
+            # source_volume NULL, so tests need to be able to express it.
+            return f"{kind}{self._n:04d}" if volume is None \
+                else f"v{volume:02d}-{kind}{self._n:04d}"
+
         def person(self, canonical_name, *, volume=1, status="provisional",
                    floruit_start=None, floruit_end=None, **cols) -> int:
             self._n += 1
             fields = {
-                "display_id": cols.pop("display_id", f"v{volume:02d}-p{self._n:04d}"),
+                "display_id": cols.pop("display_id", self._prefix(volume, "p")),
                 "legacy_id": cols.pop("legacy_id", f"p{self._n:03d}"),
                 "source_volume": volume,
                 "status": status,
@@ -124,7 +131,7 @@ def seed():
         def place(self, canonical_name, *, volume=1, status="provisional", **cols) -> int:
             self._n += 1
             fields = {
-                "display_id": cols.pop("display_id", f"v{volume:02d}-l{self._n:04d}"),
+                "display_id": cols.pop("display_id", self._prefix(volume, "l")),
                 "legacy_id": cols.pop("legacy_id", f"l{self._n:03d}"),
                 "source_volume": volume,
                 "status": status,
@@ -212,10 +219,28 @@ def seed():
                 with conn:
                     cur = conn.execute(
                         """INSERT INTO charter_persons
-                           (charter_pk, person_pk, ordinal, role_category, extracted_name)
-                           VALUES (?, ?, ?, ?, ?)""",
+                           (charter_pk, person_pk, ordinal, role_category,
+                            extracted_name, qualifier)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
                         (charter_pk, person_pk, cols.get("ordinal", 1),
                          cols.get("role_category", "witness-testimony"),
+                         cols.get("extracted_name", ""),
+                         cols.get("qualifier", "")),
+                    )
+                    return cur.lastrowid
+            finally:
+                conn.close()
+
+        def charter_place(self, charter_pk, place_pk, **cols) -> int:
+            conn = self._conn()
+            try:
+                with conn:
+                    cur = conn.execute(
+                        """INSERT INTO charter_places
+                           (charter_pk, place_pk, ordinal, role, extracted_name)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (charter_pk, place_pk, cols.get("ordinal", 1),
+                         cols.get("role", "loc.mentioned"),
                          cols.get("extracted_name", "")),
                     )
                     return cur.lastrowid

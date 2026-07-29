@@ -534,7 +534,13 @@ def promote_persons_batch(person_pks: list[int]) -> dict:
                       _promote_persons_batch_impl, person_pks)
 
 
-PERSON_UNION_FIELDS = ["variant_names", "notes", "sources", "associated_places"]
+# data_quality_flag is unioned rather than dropped: it exists to WARN about a
+# record (later transmission actor, over-merged composite), so losing it in a
+# merge destroys exactly the signal that should have prevented the merge.
+# Observed: the transmission-actor count fell 73 -> 72 purely because a flagged
+# row was merged into an unflagged survivor.
+PERSON_UNION_FIELDS = ["variant_names", "notes", "sources", "associated_places",
+                        "data_quality_flag"]
 PERSON_FIRST_NONBLANK_FIELDS = ["patronymic", "occupation", "title", "gender", "wikidata_id"]
 
 
@@ -669,12 +675,14 @@ def _merge_persons_impl(survivor_pk: int, dropped_pks: list[int]) -> dict:
 
             conn.execute(
                 """UPDATE persons SET variant_names=?, notes=?, sources=?, associated_places=?,
-                   patronymic=?, occupation=?, title=?, gender=?, wikidata_id=?,
-                   floruit_start=?, floruit_end=?, merged_volumes=?, updated_at=datetime('now')
+                   data_quality_flag=?, patronymic=?, occupation=?, title=?, wikidata_id=?,
+                   gender=?, floruit_start=?, floruit_end=?, merged_volumes=?,
+                   updated_at=datetime('now')
                    WHERE person_pk = ?""",
                 (merged["variant_names"], merged["notes"], merged["sources"],
-                 merged["associated_places"], merged["patronymic"], merged["occupation"],
-                 merged["title"], merged["gender"], merged["wikidata_id"],
+                 merged["associated_places"], merged["data_quality_flag"],
+                 merged["patronymic"], merged["occupation"], merged["title"],
+                 merged["wikidata_id"], merged["gender"],
                  merged["floruit_start"], merged["floruit_end"], merged["merged_volumes"], survivor_pk),
             )
             # Relink every reference (junction rows, review-queue outcomes,
@@ -1701,6 +1709,298 @@ def record_place_duplicate_decision(candidate_pk: int, decision: str) -> None:
     finally:
         conn.close()
     invalidate_authority_cache("place")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Charter evidence — what a person/place is actually attested by
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The comparison card used to show only extracted fields (name, occupation,
+# floruit), which is often not enough to decide anything: "Einar, priest,
+# 1340" vs "Einar, layman, 1341" at name score 100 is unresolvable from those
+# fields alone. Everything needed is already in the junction tables -- most
+# usefully charter_persons.qualifier, which carries things like "prestr at
+# Ingunarstaðir", "Bishop of Hólar", "frá Hvoli".
+#
+# 15,642 of the 15,862 open duplicate pairs have charter evidence on both
+# sides. The exceptions are real and must render as "nothing recorded" rather
+# than as a broken pane: 21 authority-imported persons have no charter link
+# at all, which also means nothing in the corpus supports them.
+
+def get_person_appearances(person_pk: int,
+                            conn: sqlite3.Connection | None = None) -> pd.DataFrame:
+    """Every charter this person is attested in, oldest first."""
+    own = conn is None
+    conn = conn or get_connection()
+    try:
+        return pd.read_sql_query(
+            """SELECT cp.charter_person_pk, cp.charter_pk, c.volume, c.sequence,
+                      c.di_reference, c.date, c.di_year, c.doc_type, c.subject,
+                      c.has_parse_error, cp.ordinal, cp.role_category, cp.qualifier,
+                      cp.extracted_name, cp.match_score, cp.resolution_state
+               FROM charter_persons cp
+               JOIN charters c ON c.charter_pk = cp.charter_pk
+               WHERE cp.person_pk = ?
+               ORDER BY c.di_year IS NULL, c.di_year, c.volume, c.sequence""",
+            conn, params=(person_pk,))
+    finally:
+        if own:
+            conn.close()
+
+
+def get_place_appearances(place_pk: int,
+                           conn: sqlite3.Connection | None = None) -> pd.DataFrame:
+    own = conn is None
+    conn = conn or get_connection()
+    try:
+        return pd.read_sql_query(
+            """SELECT cpl.charter_place_pk, cpl.charter_pk, c.volume, c.sequence,
+                      c.di_reference, c.date, c.di_year, c.doc_type, c.subject,
+                      c.has_parse_error, cpl.ordinal, cpl.role, cpl.region,
+                      cpl.extracted_name, cpl.match_score, cpl.resolution_state
+               FROM charter_places cpl
+               JOIN charters c ON c.charter_pk = cpl.charter_pk
+               WHERE cpl.place_pk = ?
+               ORDER BY c.di_year IS NULL, c.di_year, c.volume, c.sequence""",
+            conn, params=(place_pk,))
+    finally:
+        if own:
+            conn.close()
+
+
+def get_charter_cast(charter_pk: int, exclude_person_pk: int | None = None,
+                      exclude_place_pk: int | None = None,
+                      conn: sqlite3.Connection | None = None) -> dict:
+    """Who and what else appears in one charter.
+
+    Shared witness circles are decent same-person evidence; wholly disjoint
+    ones suggest different men. Also the cheapest source of geography, via
+    the loc.writing place.
+    """
+    own = conn is None
+    conn = conn or get_connection()
+    try:
+        persons = pd.read_sql_query(
+            """SELECT cp.person_pk, cp.ordinal, cp.role_category, cp.qualifier,
+                      cp.extracted_name, p.display_id, p.canonical_name
+               FROM charter_persons cp
+               LEFT JOIN persons p ON p.person_pk = cp.person_pk
+               WHERE cp.charter_pk = ?
+                 AND (? IS NULL OR cp.person_pk IS NULL OR cp.person_pk != ?)
+               ORDER BY cp.ordinal""",
+            conn, params=(charter_pk, exclude_person_pk, exclude_person_pk))
+        places = pd.read_sql_query(
+            """SELECT cpl.place_pk, cpl.ordinal, cpl.role, cpl.extracted_name,
+                      pl.display_id, pl.canonical_name,
+                      pl.coordinates_lat, pl.coordinates_long
+               FROM charter_places cpl
+               LEFT JOIN places pl ON pl.place_pk = cpl.place_pk
+               WHERE cpl.charter_pk = ?
+                 AND (? IS NULL OR cpl.place_pk IS NULL OR cpl.place_pk != ?)
+               ORDER BY CASE cpl.role WHEN 'loc.writing' THEN 0
+                                      WHEN 'loc.hearing' THEN 1 ELSE 2 END,
+                        cpl.ordinal""",
+            conn, params=(charter_pk, exclude_place_pk, exclude_place_pk))
+        return {"persons": persons, "places": places}
+    finally:
+        if own:
+            conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Composite (over-merged) person records
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The inverse of duplication: ONE id holding several real people. p027 "Jón"
+# is attested across 30 charters spanning 1180-1488 as an archbishop, a
+# bishop, a priest, a layman AND a patron saint. It is not a person; it is
+# what the bare given name "Jón" has been collecting.
+#
+# This matters beyond tidiness: all such records found so far are
+# authority-file imports with status='canonical', so search_authority offers
+# them as merge targets at score 100 to every new extraction sharing the bare
+# name -- which is presumably how p027 got to 30 charters. Merging into an
+# unsplit composite always makes it worse.
+
+COMPOSITE_SPAN_YEARS = 100
+# Roles that cannot describe the same entity as an ordinary human actor.
+NON_HUMAN_ROLES = {"saint-patron"}
+# Pairs that cannot be the same person in the same corpus.
+EXCLUSIVE_ROLE_PAIRS = [("issuer-bishop", "issuer-layman")]
+COMPOSITE_MANY_ROLES = 5
+COMPOSITE_FLAG = "composite_record"
+
+
+def _composite_findings(appearances: pd.DataFrame) -> list[dict]:
+    """Why this set of appearances may not be one person.
+
+    Returns [{"severity": "certain"|"review", "reason": str}, ...]; empty
+    means nothing suspicious. Two tiers rather than a boolean, because the
+    rules differ in how conclusive they are and conflating them would force
+    the reviewer to treat a guess like a fact:
+
+    - "certain": physically impossible. An attestation span longer than a
+      lifetime, or a patron saint sharing an id with a living actor -- both
+      confirmed against real records (p006 merges St Lawrence with a
+      contemporary Abbot Laurentius; v01-p016 merges several Pope Gregorys
+      with St Gregory).
+    - "review": suspicious but arguable. Mutually exclusive roles inside a
+      plausible lifespan can equally be loose role labelling by the
+      extractor (p030 is issuer-bishop and issuer-layman within one year),
+      and a high role count alone is only a hint.
+    """
+    if appearances.empty:
+        return []
+    findings: list[dict] = []
+
+    years = appearances["di_year"].dropna()
+    span = int(years.max() - years.min()) if len(years) >= 2 else None
+    if span is not None and span > COMPOSITE_SPAN_YEARS:
+        findings.append({
+            "severity": "certain",
+            "reason": (f"attested across {span} years "
+                       f"({int(years.min())}–{int(years.max())}), more than one lifetime"),
+        })
+
+    roles = {r for r in appearances["role_category"].fillna("") if r}
+    non_human = roles & NON_HUMAN_ROLES
+    human = roles - NON_HUMAN_ROLES
+    if non_human and human:
+        findings.append({
+            "severity": "certain",
+            "reason": (f"holds {'/'.join(sorted(non_human))} alongside living-actor "
+                       f"role(s) {', '.join(sorted(human))} — a saint and a "
+                       f"contemporary sharing one id"),
+        })
+    for a, b in EXCLUSIVE_ROLE_PAIRS:
+        if a in roles and b in roles:
+            findings.append({
+                # Already covered as "certain" by the span rule when the dates
+                # are impossible; on its own this can be a role-label artifact.
+                "severity": "certain" if (span or 0) > COMPOSITE_SPAN_YEARS else "review",
+                "reason": f"is both {a} and {b}",
+            })
+    if len(roles) >= COMPOSITE_MANY_ROLES:
+        findings.append({
+            "severity": "review",
+            "reason": f"holds {len(roles)} distinct roles: {', '.join(sorted(roles))}",
+        })
+    return findings
+
+
+def _worst_severity(findings: list[dict]) -> str | None:
+    if any(f["severity"] == "certain" for f in findings):
+        return "certain"
+    return "review" if findings else None
+
+
+def diagnose_composite(person_pk: int,
+                        conn: sqlite3.Connection | None = None) -> dict:
+    """Evidence-based verdict on whether one person record is really several.
+
+    Uses the person's OWN attestations, independent of any duplicate
+    candidate -- this asks "is this one person?", not "are these two the
+    same?".
+    """
+    own = conn is None
+    conn = conn or get_connection()
+    try:
+        appearances = get_person_appearances(person_pk, conn=conn)
+    finally:
+        if own:
+            conn.close()
+
+    years = appearances["di_year"].dropna() if not appearances.empty else pd.Series(dtype=float)
+    findings = _composite_findings(appearances)
+    return {
+        "person_pk": person_pk,
+        "is_composite": bool(findings),
+        "severity": _worst_severity(findings),
+        "findings": findings,
+        "reasons": [f["reason"] for f in findings],
+        "charters": int(appearances["charter_pk"].nunique()) if not appearances.empty else 0,
+        "appearances": len(appearances),
+        "year_min": int(years.min()) if len(years) else None,
+        "year_max": int(years.max()) if len(years) else None,
+        "span_years": int(years.max() - years.min()) if len(years) >= 2 else None,
+        "roles": sorted({r for r in appearances["role_category"].fillna("") if r})
+                 if not appearances.empty else [],
+    }
+
+
+def find_composite_persons() -> list[dict]:
+    """Every person record whose own attestations contradict each other.
+    One pass over charter_persons rather than a query per person."""
+    conn = get_connection()
+    try:
+        df = pd.read_sql_query(
+            """SELECT cp.person_pk, cp.role_category, c.di_year,
+                      cp.charter_pk, p.display_id, p.canonical_name,
+                      p.source_volume, p.status, p.data_quality_flag
+               FROM charter_persons cp
+               JOIN charters c ON c.charter_pk = cp.charter_pk
+               JOIN persons p ON p.person_pk = cp.person_pk
+               WHERE cp.person_pk IS NOT NULL""",
+            conn)
+    finally:
+        conn.close()
+    if df.empty:
+        return []
+
+    out = []
+    for person_pk, group in df.groupby("person_pk"):
+        findings = _composite_findings(group)
+        if not findings:
+            continue
+        years = group["di_year"].dropna()
+        first = group.iloc[0]
+        # pandas turns a NULL source_volume into NaN, not None -- normalise it
+        # here so callers can test `is None` instead of importing pandas to ask.
+        source_volume = first["source_volume"]
+        source_volume = None if pd.isna(source_volume) else int(source_volume)
+        out.append({
+            "person_pk": int(person_pk),
+            "display_id": first["display_id"],
+            "canonical_name": first["canonical_name"],
+            "source_volume": source_volume,
+            "status": first["status"],
+            "data_quality_flag": first["data_quality_flag"] or "",
+            "charters": int(group["charter_pk"].nunique()),
+            "year_min": int(years.min()) if len(years) else None,
+            "year_max": int(years.max()) if len(years) else None,
+            "roles": sorted({r for r in group["role_category"].fillna("") if r}),
+            "severity": _worst_severity(findings),
+            "findings": findings,
+            "reasons": [f["reason"] for f in findings],
+        })
+    # certain first, then by how much of the corpus each one distorts
+    out.sort(key=lambda r: (r["severity"] != "certain", -r["charters"]))
+    return out
+
+
+def add_data_quality_flag(person_pk: int, flag: str) -> None:
+    """Adds one flag value, preserving any already present.
+
+    data_quality_flag is a single TEXT column but genuinely multi-valued: a
+    record can be both a later-transmission actor and an over-merged
+    composite. Treated as a semicolon set, the same convention
+    variant_names/merged_volumes already use.
+    """
+    conn = get_connection()
+    try:
+        with conn:
+            row = conn.execute(
+                "SELECT data_quality_flag FROM persons WHERE person_pk = ?",
+                (person_pk,)).fetchone()
+            if row is None:
+                raise ValueError(f"No person with pk={person_pk}")
+            combined = _union_semicolon([row["data_quality_flag"] or "", flag])
+            conn.execute(
+                "UPDATE persons SET data_quality_flag = ?, updated_at = datetime('now') "
+                "WHERE person_pk = ?", (combined, person_pk))
+    finally:
+        conn.close()
+    invalidate_authority_cache("person")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

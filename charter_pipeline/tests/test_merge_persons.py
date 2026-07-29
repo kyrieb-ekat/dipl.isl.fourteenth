@@ -126,3 +126,40 @@ def test_merge_requires_at_least_one_dropped_pk(freshdb, db, seed):
     a = seed.person("Jón Sigurðsson")
     with pytest.raises(ValueError):
         db.merge_persons(a, [])
+
+
+def test_merge_preserves_a_quality_flag_from_the_dropped_row(freshdb, db, seed, query):
+    """The flags exist to WARN about a record (later transmission actor,
+    over-merged composite). Dropping one in a merge destroys exactly the
+    signal that should have prevented the merge. Observed in the live data:
+    the transmission-actor count fell 73 -> 72 for this reason alone.
+    """
+    survivor = seed.person("Jón Sigurðsson")
+    flagged = seed.person("Jon Sigurdsson",
+                          data_quality_flag="later_transmission_actor")
+
+    db.merge_persons(survivor, [flagged])
+
+    flag = query("SELECT data_quality_flag FROM persons")[0]["data_quality_flag"]
+    assert "later_transmission_actor" in flag
+
+
+def test_merge_unions_two_different_quality_flags(freshdb, db, seed, query):
+    survivor = seed.person("Jón", data_quality_flag="composite_record")
+    other = seed.person("Jon", data_quality_flag="later_transmission_actor")
+
+    db.merge_persons(survivor, [other])
+
+    flag = query("SELECT data_quality_flag FROM persons")[0]["data_quality_flag"]
+    assert "composite_record" in flag
+    assert "later_transmission_actor" in flag
+
+
+def test_merge_does_not_duplicate_the_same_flag(freshdb, db, seed, query):
+    survivor = seed.person("Jón", data_quality_flag="composite_record")
+    other = seed.person("Jon", data_quality_flag="composite_record")
+
+    db.merge_persons(survivor, [other])
+
+    flag = query("SELECT data_quality_flag FROM persons")[0]["data_quality_flag"]
+    assert flag.split(";").count("composite_record") == 1
