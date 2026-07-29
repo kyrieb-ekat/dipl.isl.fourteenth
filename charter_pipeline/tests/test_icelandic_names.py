@@ -217,3 +217,72 @@ def test_no_real_place_name_crashes_the_parser(livedb, db):
     for n in names:
         il.parse(n)          # must not raise on anything in the corpus
     assert len(names) > 2000
+
+
+# ── search_authority integration ────────────────────────────────────────────
+
+def test_place_search_drops_positively_different_candidates(freshdb, db, seed):
+    """Reynivellir vs Reynistaður share the specific `reyni` and are still two
+    places. Offering that as a possible match is worse than offering nothing --
+    it is exactly the noise that made the old listing tedious."""
+    seed.place("Reynistaður", status="canonical")
+    seed.place("Reykjavík", status="canonical")
+
+    assert db.search_authority("place", "Reynivellir") == []
+
+
+def test_place_search_finds_an_inflected_variant(freshdb, db, seed):
+    seed.place("Hólar", status="canonical")
+
+    hits = db.search_authority("place", "Hólum")
+
+    assert len(hits) == 1
+    assert hits[0]["canonical_name"] == "Hólar"
+    assert hits[0]["_match_verdict"] == il.SAME
+    assert hits[0]["_match_score"] == 100.0
+
+
+def test_place_search_ranks_paradigm_variants_above_fuzzy_guesses(freshdb, db, seed):
+    seed.place("Möðruvellir", status="canonical")
+    seed.place("Möðrudalur", status="canonical")
+
+    hits = db.search_authority("place", "Möðruvöllum", limit=5)
+
+    assert hits[0]["canonical_name"] == "Möðruvellir"
+    assert hits[0]["_match_verdict"] == il.SAME
+
+
+def test_place_search_carries_a_reason_for_the_ui(freshdb, db, seed):
+    seed.place("Hólar", status="canonical")
+    hit = db.search_authority("place", "Hólum")[0]
+    assert "_match_reason" in hit and hit["_match_reason"]
+
+
+def test_place_search_suppresses_low_scoring_unresolved_candidates(freshdb, db, seed):
+    seed.place("Kirkjubæjarklaustur", status="canonical")
+    assert db.search_authority("place", "Róm") == []
+
+
+def test_person_search_is_unchanged(freshdb, db, seed):
+    """Persons are <given> <patronymic>, a different shape; they keep
+    token_sort_ratio and gain no verdict."""
+    seed.person("Jón Sigurðsson", status="canonical")
+
+    hits = db.search_authority("person", "Jon Sigurdsson")
+
+    assert hits and hits[0]["canonical_name"] == "Jón Sigurðsson"
+    assert "_match_verdict" not in hits[0]
+
+
+def test_no_match_subheader_says_so_plainly(freshdb, db, seed):
+    import review_queue
+    assert "No plausible authority match" in review_queue._match_subheader(None)
+
+
+def test_subheader_includes_the_morphological_reason(freshdb, db, seed):
+    import review_queue
+    seed.place("Hólar", status="canonical")
+    match = db.search_authority("place", "Hólum")[0]
+    text = review_queue._match_subheader(match)
+    assert "Paradigm variant" in text
+    assert "hóll" in text

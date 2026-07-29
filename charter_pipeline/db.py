@@ -1024,19 +1024,90 @@ def merge_into_authority(entity_type: str, provisional_pk: int, authority_pk: in
 
 
 def search_authority(entity_type: str, name: str, limit: int = 3) -> list[dict]:
-    """On-demand fuzzy lookup against the canonical table for the Compare
-    Panel's New-Entities entry point (these rows have no precomputed
-    candidate, unlike Review Queue/Final Review rows)."""
-    from rapidfuzz import fuzz, process
+    """On-demand lookup against the canonical table, for the review card's
+    "potential match" listing (these rows have no precomputed candidate,
+    unlike Review Queue/Final Review rows).
+
+    For PLACES this is morphology-aware (see icelandic_names): candidates are
+    ranked by a compound-aware score that weights the distinguishing element
+    over the shared generic one, and each carries a verdict and a plain-English
+    reason. Character similarity alone ranked `reynivellir` against
+    `viðivellir` as a near-match purely because both end in -vellir, which
+    filled the listing with names that share a suffix and nothing else.
+
+    Results are ordered by verdict first, then score: a confirmed paradigm
+    variant should never appear below a coincidental suffix match, whatever
+    their string similarity. Rows that are morphologically DIFFERENT are kept
+    rather than dropped -- the reviewer may still want to see the near misses --
+    but they sort last and say why.
+
+    Persons keep token_sort_ratio: `<given> <patronymic>` is a different shape
+    from a compound toponym, and the person path deliberately avoids WRatio
+    already (see 07_find_person_duplicates.py).
+    """
     df = _load_canonical_df(entity_type)
     if df.empty:
         return []
+
+    if entity_type == "place":
+        return _search_places_morphological(df, name, limit)
+
+    from rapidfuzz import fuzz, process
     names = df["canonical_name"].tolist()
     matches = process.extract(name, names, scorer=fuzz.token_sort_ratio, limit=limit)
     out = []
-    for matched_name, score, idx in matches:
+    for _matched_name, score, idx in matches:
         row = df.iloc[idx].to_dict()
         row["_match_score"] = score
+        out.append(row)
+    return out
+
+
+# Verdict ordering for candidate listings. DERIVED sits above UNRESOLVED
+# because a subsidiary parcel is a real, named relationship worth seeing even
+# though it isn't an identity.
+_VERDICT_RANK = {"same": 0, "derived": 1, "unresolved": 2}
+
+# Floor for showing a candidate the paradigms could not adjudicate. Below this
+# there is no reason to put a name in front of a reviewer: it is neither a
+# provable variant nor close enough to be worth a second look. Purely a display
+# threshold -- it gates nothing and writes nothing.
+PLACE_CANDIDATE_FLOOR = 70.0
+
+
+def _search_places_morphological(df, name: str, limit: int) -> list[dict]:
+    """Ranks canonical places against `name`, dropping the hopeless ones.
+
+    Candidates the paradigms judge DIFFERENT are excluded entirely. That is a
+    positive finding of distinctness -- same generic element, different
+    distinguishing element -- so offering it as a possible match is worse than
+    offering nothing: it is exactly the "grossly different entries" that made
+    the old listing tedious to read. `Reynivellir` vs `Reynistaður` is the
+    shape: they share the specific `reyni`, and they are still two places.
+
+    Returning an empty list is a real and useful answer. The caller renders it
+    as "no plausible match", and the reviewer can add/skip without being
+    invited to merge into something wrong.
+    """
+    import icelandic_names as il
+
+    scored = []
+    for idx, candidate in enumerate(df["canonical_name"].tolist()):
+        result = il.compare(name, candidate)
+        verdict = result["verdict"]
+        if verdict == il.DIFFERENT:
+            continue
+        if verdict == il.UNRESOLVED and result["score"] < PLACE_CANDIDATE_FLOOR:
+            continue
+        scored.append((_VERDICT_RANK.get(verdict, 9), -result["score"], idx, result))
+    scored.sort(key=lambda t: t[:3])
+
+    out = []
+    for _rank, _neg_score, idx, result in scored[:limit]:
+        row = df.iloc[idx].to_dict()
+        row["_match_score"] = result["score"]
+        row["_match_verdict"] = result["verdict"]
+        row["_match_reason"] = result["reason"]
         out.append(row)
     return out
 

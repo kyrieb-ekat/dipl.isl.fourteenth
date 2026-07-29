@@ -151,10 +151,22 @@ def _is_high_confidence(match: dict | None) -> bool:
 
 def _match_subheader(match: dict | None) -> str:
     if not match:
-        return "No plausible authority match found."
+        return ("No plausible authority match found — nothing close enough to be "
+                "worth comparing.")
     score = match.get("_match_score", 0)
     confidence = "High-confidence" if _is_high_confidence(match) else "Possible"
-    return f"{confidence} authority match: {match['display_id']}  (score {score:.0f})"
+    base = f"{confidence} authority match: {match['display_id']}  (score {score:.0f})"
+    # Places carry a morphological verdict and a plain-English reason (see
+    # db.search_authority / icelandic_names). Showing the reason is the point:
+    # it lets a reviewer dismiss a whole class of candidate at a glance instead
+    # of re-deriving why each one is wrong.
+    reason = match.get("_match_reason")
+    if reason:
+        verdict = match.get("_match_verdict", "")
+        label = {"same": "Paradigm variant", "derived": "Subsidiary parcel",
+                 "unresolved": "Unverified"}.get(verdict, verdict.title())
+        return f"{base} · **{label}** — {reason}"
+    return base
 
 
 def _merge_action(match: dict | None):

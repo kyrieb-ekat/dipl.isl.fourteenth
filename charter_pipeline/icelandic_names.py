@@ -142,8 +142,12 @@ def normalize_orthography(name: str) -> str:
     n = unicodedata.normalize("NFC", name).strip().lower()
     n = re.sub(r"[.,;:'\"]", "", n)
     n = re.sub(r"\s+", " ", n)
-    # Intervocalic f ~ v is phonological, not morphological.
-    n = re.sub(rf"([{_VOWELS}])f([{_VOWELS}])", r"\1v\2", n)
+    # NOTE: f ~ v alternation is deliberately NOT rewritten here. Doing so
+    # destroys generic elements: `barnafell` became `barnavell`, which no
+    # longer ends in -fell, so the name stopped resolving -- and the same
+    # applies to every -fell / -fjörður / -höfn compound after a vowel. The
+    # alternation is handled by registering both spellings in the form index
+    # instead (see _FORM_INDEX), the same way -r/-ur variance is.
     # Graphic i/j variance before a vowel.
     n = re.sub(rf"j([{_VOWELS}])", r"i\1", n)
     # Degemination ONLY of -ss at a morpheme boundary (Ness ~ nes, Hvammss- ~
@@ -167,22 +171,57 @@ def _strip_r_ur(form: str) -> str:
 # form silently stops it matching. The i/j rule does exactly that to `bæjar`
 # (-> `bæiar`), which would have made every -bær genitive unresolvable while
 # looking like a coverage gap rather than a bug.
+def _spelling_variants(form: str) -> set[str]:
+    """Alternative spellings of one paradigm cell that a source might use.
+
+    Variance belongs in the index rather than in the lookup key, because the
+    source is the thing that varies: a charter may write `dalr` for `dalur`, or
+    `-vell` for `-fell`. Transforming the lookup key instead only converts
+    dictionary spellings into period ones, which is backwards, and rewriting
+    f->v in the key actively destroyed generic elements (`barnafell` became
+    `barnavell`, which no longer ends in -fell).
+    """
+    out = {_strip_r_ur(form)}                       # dalur ~ dalr
+    for f in tuple(out) + (form,):                  # f ~ v at the boundary
+        if f.startswith("f"):
+            out.add("v" + f[1:])
+        elif f.startswith("v"):
+            out.add("f" + f[1:])
+    out.discard(form)
+    return out
+
+
+# Two indexes, deliberately. A form that is a REAL cell of some paradigm must
+# outrank a hypothetical spelling variant of another -- otherwise generating
+# f/v variants makes `fell`'s `felli` produce `velli`, which collides with
+# `völlur`'s genuine dat.sg `velli` and silently steals it. Canonical forms are
+# consulted first and variants only fill gaps.
 _FORM_INDEX: dict[str, set[tuple[str, str]]] = {}
+_VARIANT_INDEX: dict[str, set[tuple[str, str]]] = {}
+
 for _lemma, _forms in PARADIGMS.items():
     for _case, _form in zip(CASES, _forms):
-        _norm = normalize_orthography(_form)
-        _FORM_INDEX.setdefault(_norm, set()).add((_lemma, _case))
-        # Register the -r spelling of any -ur form as well. The variance runs
-        # in the direction the source has it (a charter may write `dalr` where
-        # the dictionary form is `dalur`), so the alternative has to be in the
-        # INDEX -- transforming the lookup key instead only ever converts
-        # dictionary spellings into period ones, which is backwards.
-        _variant = _strip_r_ur(_norm)
-        if _variant != _norm:
-            _FORM_INDEX.setdefault(_variant, set()).add((_lemma, _case))
+        _FORM_INDEX.setdefault(normalize_orthography(_form), set()).add((_lemma, _case))
 
-# Longest first, so "staðir" wins over "ir" and "ness" over "nes".
+for _lemma, _forms in PARADIGMS.items():
+    for _case, _form in zip(CASES, _forms):
+        for _variant in _spelling_variants(normalize_orthography(_form)):
+            if _variant not in _FORM_INDEX:
+                _VARIANT_INDEX.setdefault(_variant, set()).add((_lemma, _case))
+
+# Longest first, so "staðir" wins over "ir" and "ness" over "nes". Canonical
+# forms are scanned before variants for the same reason the indexes are split.
 _FORMS_BY_LENGTH = tuple(sorted(_FORM_INDEX, key=len, reverse=True))
+_VARIANTS_BY_LENGTH = tuple(sorted(_VARIANT_INDEX, key=len, reverse=True))
+
+
+def _lookup(form: str) -> tuple[str, str] | None:
+    """Resolves one string to (lemma, case), canonical spellings first."""
+    for index in (_FORM_INDEX, _VARIANT_INDEX):
+        cells = index.get(form)
+        if cells:
+            return min(cells, key=lambda lc: (CASES.index(lc[1]) != 0, lc[0], lc[1]))
+    return None
 
 
 # ── Section 2 applied: parsing ──────────────────────────────────────────────
@@ -221,33 +260,23 @@ def parse(name: str) -> ParsedName:
     if not norm:
         return ParsedName(name, norm, "", None, None)
 
-    candidates = (norm, _strip_r_ur(norm))
-    for form in candidates:
-        if form in _FORM_INDEX:
-            lemma, case = _best_cell(form)
-            return ParsedName(name, norm, "", lemma, case)
+    # Whole name is a bare generic (a simplex like Hólar or Akrar).
+    cell = _lookup(norm)
+    if cell:
+        return ParsedName(name, norm, "", cell[0], cell[1])
 
-    for suffix in _FORMS_BY_LENGTH:
-        for form in candidates:
+    # Otherwise split off the longest trailing generic, canonical spellings
+    # before variants.
+    for suffixes in (_FORMS_BY_LENGTH, _VARIANTS_BY_LENGTH):
+        for suffix in suffixes:
             # Require at least 2 characters of specific element -- a 1-char
-            # remainder is far more likely to be a mis-split than a real
-            # compound.
-            if form.endswith(suffix) and len(form) > len(suffix) + 1:
-                lemma, case = _best_cell(suffix)
-                return ParsedName(name, norm, form[:-len(suffix)], lemma, case)
+            # remainder is far more likely a mis-split than a real compound.
+            if norm.endswith(suffix) and len(norm) > len(suffix) + 1:
+                cell = _lookup(suffix)
+                if cell:
+                    return ParsedName(name, norm, norm[:-len(suffix)],
+                                      cell[0], cell[1])
     return ParsedName(name, norm, norm, None, None)
-
-
-def _best_cell(form: str) -> tuple[str, str]:
-    """Picks one (lemma, case) for an ambiguous form.
-
-    Ambiguity is common and mostly harmless here: what downstream logic needs
-    is the LEMMA, and forms shared between paradigms are rare. Ordering is
-    fixed (nominative preferred, then alphabetical) purely so results are
-    deterministic across runs.
-    """
-    cells = _FORM_INDEX[form]
-    return min(cells, key=lambda lc: (CASES.index(lc[1]) != 0, lc[0], lc[1]))
 
 
 def is_genitive_of(form: str, lemma: str) -> bool:
@@ -256,8 +285,8 @@ def is_genitive_of(form: str, lemma: str) -> bool:
     if not form or not lemma:
         return False
     f = normalize_orthography(form)
-    return any(lm == lemma and case in GENITIVE_CASES
-               for lm, case in _FORM_INDEX.get(f, ()))
+    cells = _FORM_INDEX.get(f, set()) | _VARIANT_INDEX.get(f, set())
+    return any(lm == lemma and case in GENITIVE_CASES for lm, case in cells)
 
 
 # ── Comparison ──────────────────────────────────────────────────────────────
