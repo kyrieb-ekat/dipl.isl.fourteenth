@@ -4,9 +4,12 @@ Step 2: Extract structured entities from charter text segments using the Claude 
 Usage:
     python 02_extract_entities.py --vol 1
     python 02_extract_entities.py --vol 1 --start 50 --end 100   # resume / slice
+    python 02_extract_entities.py --vol 1 \
+        --segments-dir output/segments_corrected/vol01 \
+        --output output/entities_corrected/vol01_raw_entities.json  # re-extract from corrected text
 
-Reads:  output/segments/vol{N}/*.txt + charter_index.csv
-Writes: output/entities/vol{N}_raw_entities.json  (appended incrementally)
+Reads:  output/segments/vol{N}/*.txt + charter_index.csv (or --segments-dir override)
+Writes: output/entities/vol{N}_raw_entities.json  (appended incrementally; or --output override)
 
 Requires: ANTHROPIC_API_KEY environment variable.
 """
@@ -164,6 +167,12 @@ def main():
     parser.add_argument("--vol", type=int, required=True, help="Volume number to process.")
     parser.add_argument("--start", type=int, default=1, help="First charter sequence number (1-based). Default: 1.")
     parser.add_argument("--end", type=int, default=None, help="Last charter sequence number (inclusive). Default: all.")
+    parser.add_argument("--segments-dir", type=Path, default=None,
+                        help="Override the segments directory (e.g. to re-extract from "
+                             "OCR-corrected segments). Default: SEGMENTS_DIR/vol{N:02d} (live).")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Override the output JSON path. Default: "
+                             "ENTITIES_DIR/vol{N:02d}_raw_entities.json (live).")
     args = parser.parse_args()
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -173,8 +182,22 @@ def main():
 
     client = anthropic.Anthropic(api_key=api_key)
 
-    vol_dir = SEGMENTS_DIR / f"vol{args.vol:02d}"
-    out_path = ENTITIES_DIR / f"vol{args.vol:02d}_raw_entities.json"
+    default_vol_dir = SEGMENTS_DIR / f"vol{args.vol:02d}"
+    default_out_path = ENTITIES_DIR / f"vol{args.vol:02d}_raw_entities.json"
+    vol_dir = args.segments_dir or default_vol_dir
+    out_path = args.output or default_out_path
+
+    # Refuse to silently read alternate (e.g. OCR-corrected) segments while
+    # writing into the live, already-reviewed entities file -- vol01/vol04
+    # already have real human review decisions built on the live file's
+    # current content, and this codebase has no fingerprint/mtime check
+    # anywhere that would otherwise catch that collision.
+    if vol_dir.resolve() != default_vol_dir.resolve() and out_path.resolve() == default_out_path.resolve():
+        parser.error(
+            f"--segments-dir points away from the live segments ({vol_dir}), but --output "
+            f"still resolves to the live entities file ({default_out_path}). Pass --output "
+            f"explicitly to an alternate path."
+        )
 
     index = load_index(vol_dir)
     existing = load_existing_results(out_path)
