@@ -4,6 +4,7 @@ Extracted from review_app.py so more than one screen can render a card, and
 so it can be exercised by streamlit.testing's AppTest without executing the
 whole app at import time.
 """
+import html
 import sys
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import db  # noqa: E402
 import diff_render  # noqa: E402
 import hotkeys  # noqa: E402
 import review_queue  # noqa: E402
+from config import SEGMENTS_CORRECTED_DIR  # noqa: E402
 from ui import evidence  # noqa: E402
 
 
@@ -62,6 +64,69 @@ def _safe(fn, *args, what: str = "evidence", **kwargs):
         return None
 
 
+def _render_ocr_excerpt(rq_item) -> None:
+    """The flagged excerpt with its specific suspicious substring highlighted
+    -- rendered separately from diff_render.render_diff_table() rather than
+    through it, since that function always re-escapes/re-diffs whatever
+    strings it's given (via char_diff_spans), which would double-escape
+    already-rendered HTML instead of displaying it. density_outlier flags
+    have no single substring to point at (a whole-segment statistic, not a
+    span), so those just get plain-escaped excerpt text.
+
+    Locates the highlight by searching for matched_text directly within the
+    excerpt, NOT by char_start/char_end - excerpt_offset arithmetic: the
+    excerpt string is whitespace-NORMALIZED (01c_flag_ocr_for_review.py joins
+    it with " ".join(text.split()) for readability), which collapses
+    newlines/runs of spaces and shifts every position after the first such
+    run -- offset arithmetic against that normalized string lands on the
+    wrong character (confirmed: highlighted "err" instead of the actual
+    "<)x" match during verification). matched_text itself never contains
+    whitespace, so a plain substring search is unaffected by that collapsing
+    and finds the right spot directly."""
+    p = rq_item.payload
+    excerpt = p.get("excerpt", "")
+    matched = p.get("matched_text") or ""
+    idx = excerpt.find(matched) if matched else -1
+    if idx >= 0:
+        body = diff_render.render_highlighted_span(excerpt, idx, idx + len(matched))
+    else:
+        body = html.escape(excerpt)
+    st.markdown(f"> {body}", unsafe_allow_html=True)
+
+
+def _render_ocr_evidence(rq_item) -> None:
+    """ocr_fix's evidence panes: the corrected segment text (not
+    ui.evidence.render_charter_text, which reads the LIVE output/segments/ --
+    this flag was raised against output/segments_corrected/, so that's the
+    text a reviewer should be checking against) and the source scanned page
+    image, anchored on the segment's page_start (an approximation for long
+    segments -- see the caption below -- not a precise offset-to-page
+    mapping)."""
+    p = rq_item.payload
+
+    with st.expander("Segment text (corrected)", expanded=False):
+        path = (SEGMENTS_CORRECTED_DIR / f"vol{p['volume']:02d}"
+                / f"DI_{p['volume']:02d}_{p['sequence']:04d}.txt")
+        if not path.exists():
+            st.caption("No corrected segment file found.")
+        else:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            st.markdown(
+                f'<div style="max-height:340px;overflow-y:auto;white-space:pre-wrap;'
+                f'font-size:0.85em;line-height:1.45;padding:0.6em;'
+                f'border:1px solid rgba(128,128,128,0.35);border-radius:4px;">'
+                f'{html.escape(text)}</div>',
+                unsafe_allow_html=True)
+
+    with st.expander("Source page image", expanded=False):
+        page = st.number_input("Page", min_value=1, value=p["page_start"],
+                               key=f"ocr_page_{rq_item.item_id}")
+        if p.get("segment_length", 0) > 5000:
+            st.caption("This segment is long and may span several pages -- "
+                       "the image shown is just where it starts.")
+        evidence.render_page_image(p["volume"], int(page))
+
+
 def render_item_card(rq_item, on_action=None, key_prefix: str = "rq_act",
                      bind_keys: bool = True, show_evidence: bool = True) -> None:
     """Renders one queue item and its action buttons.
@@ -93,8 +158,17 @@ def render_item_card(rq_item, on_action=None, key_prefix: str = "rq_act",
     with st.container(border=True):
         st.markdown(f"#### {rq_item.header}")
         st.caption(rq_item.subheader)
+
+        correction_key = f"{key_prefix}_correction"
+        if rq_item.item_type == "ocr_fix":
+            _safe(_render_ocr_excerpt, rq_item, what="the flagged excerpt")
         diff_render.render_diff_table(rq_item.diff_rows, rq_item.left_label,
                                       rq_item.right_label)
+        if rq_item.item_type == "ocr_fix":
+            default = rq_item.payload.get("matched_text") or ""
+            st.text_area("Corrected reading" if default else "Note (optional)",
+                        value=st.session_state.get(correction_key, default),
+                        key=correction_key, height=80)
 
         composites = (_safe(_composite_warning, rq_item,
                             what="the composite-record check") or []) if show_evidence else []
@@ -131,7 +205,9 @@ def render_item_card(rq_item, on_action=None, key_prefix: str = "rq_act",
                 action_hotkeys[widget_key] = rq_action.hotkey
                 if clicked:
                     if rq_action.action != "next":
-                        review_queue.apply_action(rq_item, rq_action.action)
+                        extra = ({"human_correction": st.session_state.get(correction_key, "")}
+                                if rq_item.item_type == "ocr_fix" else None)
+                        review_queue.apply_action(rq_item, rq_action.action, extra)
                         st.toast(f"{rq_action.label.split(' (')[0]} — done.")
                     if on_action:
                         on_action(rq_action.action)
@@ -155,5 +231,8 @@ def render_item_card(rq_item, on_action=None, key_prefix: str = "rq_act",
                 )
 
         if show_evidence:
-            _safe(evidence.render_panes, rq_item, key_prefix,
-                  what="the charter-evidence panes")
+            if rq_item.item_type == "ocr_fix":
+                _safe(_render_ocr_evidence, rq_item, what="the source page image")
+            else:
+                _safe(evidence.render_panes, rq_item, key_prefix,
+                      what="the charter-evidence panes")

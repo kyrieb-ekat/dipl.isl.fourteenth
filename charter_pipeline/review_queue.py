@@ -35,7 +35,7 @@ from diff_render import blank
 # ordered last (just before "next") otherwise.
 MERGE_SUGGEST_THRESHOLD = 90
 
-ALL_ITEM_TYPES = {"new_person", "new_place", "person_dup", "place_dup", "review_item"}
+ALL_ITEM_TYPES = {"new_person", "new_place", "person_dup", "place_dup", "review_item", "ocr_fix"}
 
 # Item types where selecting 2+ entries and merging them together (peer-to-
 # peer, not "into an authority match") is semantically real -- place_dup
@@ -483,12 +483,89 @@ def _materialize_review_item(entry: QueueIndexEntry) -> QueueItem:
     )
 
 
+# ── ocr_fix ───────────────────────────────────────────────────────────────
+# Populated by 01c_flag_ocr_for_review.py from output/segments_corrected/ --
+# not tied to persons/places/charter_persons at all, so this works
+# independent of whether 02_extract_entities.py has even run for a volume.
+# Follows the 09_flag_transmission_actors.py/10_flag_composite_persons.py
+# precedent (own flag source + own card logic), not the person/place merge
+# machinery -- there's no "authority match" concept here, just a segment
+# excerpt a human needs to read and possibly retype.
+
+def _index_ocr_fix_items(volumes: list | None) -> list:
+    entries = []
+    df = db.get_ocr_flags(status="open")
+    if volumes:
+        df = df[df["volume"].isin(volumes)]
+    for row in df.to_dict("records"):
+        matched = row.get("matched_text") or ""
+        vol_i, seq_i = int(row["volume"]), int(row["sequence"])
+        entries.append(QueueIndexEntry(
+            item_id=f"ocr_fix:{row['ocr_flag_pk']}",
+            item_type="ocr_fix",
+            volume=_to_int(row["volume"]),
+            sort_score=row["suspicion_score"] or 0,
+            sort_name=f"vol{vol_i:02d}_{seq_i:04d}",
+            list_label=f"vol{vol_i:02d} seq{seq_i:04d} · {row['heuristic']}"
+                       + (f" · {matched}" if matched else ""),
+            search_text=f"{row['heuristic']} {matched} {row['detail'] or ''}".lower(),
+            row=row,
+        ))
+    return entries
+
+
+def _materialize_ocr_fix(entry: QueueIndexEntry) -> QueueItem:
+    row = entry.row
+    volume, sequence = int(row["volume"]), int(row["sequence"])
+    char_start = row.get("char_start")
+    # Mixing bracket_cluster/h_pattern rows (real char_start) with
+    # density_outlier rows (NULL char_start) in one DataFrame upcasts the
+    # whole column to float64 with NaN for the NULLs -- same pandas
+    # NaN-vs-None pitfall _to_int() above already guards against.
+    has_span = char_start is not None and not (isinstance(char_start, float) and pd.isna(char_start))
+
+    # A plain diff_rows entry (not the highlighted excerpt itself -- that
+    # needs raw HTML, which render_diff_table would double-escape via
+    # char_diff_spans; ui/cards.py renders it separately via
+    # diff_render.render_highlighted_span() instead, using this item's
+    # payload). Empty-left/text-right mirrors place_dup's existing
+    # one-sided-info convention (e.g. its "Coordinates" row).
+    diff_rows = [("Why flagged", "", row["detail"] or "")]
+
+    return QueueItem(
+        item_id=entry.item_id,
+        item_type="ocr_fix",
+        volume=entry.volume,
+        header=f"vol{volume:02d} seq{sequence:04d} · {row['heuristic']}",
+        subheader=row["detail"] or "",
+        left_label="", right_label="",
+        diff_rows=diff_rows,
+        actions=[
+            QueueAction("a", "correct", "Save correction (a)", "primary"),
+            QueueAction("o", "ok", "Mark OK / not corrupted (o)"),
+            QueueAction("u", "unresolvable", "Flag unresolvable (u)"),
+            QueueAction("n", "next", "Next / not sure yet (n)"),
+        ],
+        payload={
+            "ocr_flag_pk": int(row["ocr_flag_pk"]), "volume": volume, "sequence": sequence,
+            "heuristic": row["heuristic"],
+            "excerpt": row["excerpt"] or "", "excerpt_offset": int(row["excerpt_offset"] or 0),
+            "char_start": int(char_start) if has_span else None,
+            "char_end": int(row["char_end"]) if has_span else None,
+            "matched_text": row["matched_text"] or "",
+            "page_start": int(row["page_start"]), "segment_length": int(row["segment_length"]),
+        },
+        sort_score=entry.sort_score,
+    )
+
+
 _INDEX_BUILDERS = {
     "new_person": _index_new_person_items,
     "new_place": _index_new_place_items,
     "person_dup": _index_person_dup_items,
     "place_dup": _index_place_dup_items,
     "review_item": _index_review_items,
+    "ocr_fix": _index_ocr_fix_items,
 }
 
 _MATERIALIZERS = {
@@ -497,6 +574,7 @@ _MATERIALIZERS = {
     "person_dup": _materialize_person_dup,
     "place_dup": _materialize_place_dup,
     "review_item": _materialize_review_item,
+    "ocr_fix": _materialize_ocr_fix,
 }
 
 
@@ -533,11 +611,17 @@ def materialize(entry: QueueIndexEntry) -> QueueItem:
     return _MATERIALIZERS[entry.item_type](entry)
 
 
-def apply_action(item: QueueItem, action_key: str) -> dict:
+def apply_action(item: QueueItem, action_key: str, extra: dict | None = None) -> dict:
     """Dispatches action_key to the right db.py mutator for item.item_type.
     "next" (available on every item) is a pure no-op -- the caller advances
-    the queue position without this function mutating anything."""
+    the queue position without this function mutating anything.
+
+    extra: optional companion payload for actions that need more than a pure
+    click (currently only ocr_fix's free-text corrected reading). Defaults to
+    None and is ignored by every other item type, so this is non-breaking for
+    existing call sites."""
     p = item.payload
+    extra = extra or {}
 
     if action_key == "next":
         return {"action": "next"}
@@ -615,6 +699,17 @@ def apply_action(item: QueueItem, action_key: str) -> dict:
         else:
             raise ValueError(f"Unknown action {action_key!r} for review_item")
         return {"action": action_key, **result}
+
+    if item.item_type == "ocr_fix":
+        # action_key ("correct") is the verb shown on the button/hotkey;
+        # ocr_flags.status ("corrected") is the stored noun -- schema.sql's
+        # CHECK constraint only accepts the latter.
+        status_by_action = {"correct": "corrected", "ok": "ok", "unresolvable": "unresolvable"}
+        if action_key not in status_by_action:
+            raise ValueError(f"Unknown action {action_key!r} for ocr_fix")
+        db.set_ocr_flag_decision(p["ocr_flag_pk"], status_by_action[action_key],
+                                  human_correction=extra.get("human_correction", ""))
+        return {"action": action_key, "ocr_flag_pk": p["ocr_flag_pk"]}
 
     raise ValueError(f"Unknown item_type {item.item_type!r}")
 

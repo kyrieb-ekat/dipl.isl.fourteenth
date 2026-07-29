@@ -234,4 +234,58 @@ CREATE TABLE place_duplicate_candidates (
 );
 CREATE INDEX ix_place_dup_place ON place_duplicate_candidates(place_pk);
 
+-- Populated by 01c_flag_ocr_for_review.py from output/segments_corrected/ (the
+-- 01b_apply_ocr_corrections.py output) -- NOT tied to charters.charter_pk, since
+-- OCR-quality review needs to work independent of whether 02_extract_entities.py
+-- has even run for this volume yet. Keyed on (volume, sequence) only, same as
+-- charter_index.csv itself.
+CREATE TABLE ocr_flags (
+    ocr_flag_pk       INTEGER PRIMARY KEY AUTOINCREMENT,
+    volume            INTEGER NOT NULL,
+    sequence          INTEGER NOT NULL,
+    heuristic         TEXT NOT NULL CHECK (heuristic IN ('bracket_cluster','density_outlier','h_pattern')),
+    -- 0-based codepoint offsets into the segment .txt file (str-slice
+    -- semantics, not byte offsets). NULL for density_outlier: that heuristic
+    -- is a whole-segment statistic, not a located span -- there's no single
+    -- "here" to point at.
+    char_start        INTEGER,
+    char_end          INTEGER,
+    matched_text      TEXT NOT NULL DEFAULT '',
+    -- first 2 chars of matched_text for bracket_cluster (e.g. "<>", "()") --
+    -- display/filter convenience only, never gates anything.
+    shape             TEXT NOT NULL DEFAULT '',
+    excerpt           TEXT NOT NULL DEFAULT '',
+    excerpt_offset    INTEGER NOT NULL DEFAULT 0,
+    -- from charter_index.csv at flagging time -- the page-image anchor. A
+    -- long segment can span more than one PDF page; this is deliberately an
+    -- approximation (see ui/cards.py's page-stepper control), not a precise
+    -- offset-to-page mapping.
+    page_start        INTEGER NOT NULL,
+    segment_length    INTEGER NOT NULL,
+    -- density_outlier only: this segment's thorn_eth_density_per_1000 and
+    -- the volume's median at flagging time, precomputed so the review card's
+    -- "why flagged" line never needs to rescan other segments.
+    metric_value      REAL,
+    metric_reference  REAL,
+    detail            TEXT NOT NULL DEFAULT '',
+    -- mirrors 01a_audit_ocr_quality.py's own weighting (2/5/1) for default
+    -- worst-first sort in the review queue.
+    suspicion_score   REAL NOT NULL DEFAULT 0,
+    status            TEXT NOT NULL DEFAULT 'open'
+                          CHECK (status IN ('open','corrected','ok','unresolvable')),
+    human_correction  TEXT NOT NULL DEFAULT '',
+    decided_at        TEXT,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX ix_ocr_flags_status ON ocr_flags(status);
+CREATE INDEX ix_ocr_flags_volume ON ocr_flags(volume);
+-- Only covers match-level rows: SQLite treats every NULL as distinct under a
+-- plain UNIQUE constraint, so a table-wide constraint would silently fail to
+-- dedupe density_outlier's NULL-offset rows (deduped in application code
+-- instead, via a pre-insert SELECT). Re-running 01c_flag_ocr_for_review.py is
+-- therefore always safe for bracket_cluster/h_pattern rows -- it never
+-- inserts a duplicate for the same (volume, sequence, heuristic, span).
+CREATE UNIQUE INDEX ix_ocr_flags_dedup ON ocr_flags(volume, sequence, heuristic, char_start, char_end)
+    WHERE char_start IS NOT NULL;
+
 PRAGMA user_version = 1;

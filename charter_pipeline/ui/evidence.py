@@ -126,6 +126,34 @@ def render_charter_text(volume: int, sequence: int, highlight: str = "",
         unsafe_allow_html=True)
 
 
+@st.cache_data(show_spinner=False)
+def load_page_image_bytes(volume: int, page: int) -> bytes | None:
+    """Mirrors load_charter_text's disk-read-wrapped-in-st.cache_data pattern.
+    Extraction itself is cheap (~0.05-0.2s via pdfimages -j, see pdf_pages.py)
+    and only a small, bounded subset of pages will ever actually be opened,
+    so this generates strictly on first request rather than pre-rendering --
+    same reasoning as this module's own docstring gives for collapsed
+    expanders not querying eagerly."""
+    import pdf_pages
+    pdf_path = pdf_pages.resolve_pdf_path(volume)
+    if pdf_path is None:
+        return None
+    cache_dir = config.OUTPUT_DIR / "page_images" / f"vol{volume:02d}"
+    img_path = pdf_pages.extract_page_image(pdf_path, page, cache_dir)
+    if img_path is None:
+        return None
+    return img_path.read_bytes()
+
+
+def render_page_image(volume: int, page: int, caption: str = "") -> None:
+    data = load_page_image_bytes(int(volume), int(page))
+    if data is None:
+        st.caption(f"No page image available for vol{int(volume):02d}, page {int(page)}.")
+        return
+    st.image(data, caption=caption or f"vol{int(volume):02d}, page {int(page)}",
+             use_container_width=True)
+
+
 def render_charter_cast(charter_pk: int, exclude_person_pk=None,
                          exclude_place_pk=None) -> None:
     cast = db.get_charter_cast(charter_pk, exclude_person_pk=exclude_person_pk,

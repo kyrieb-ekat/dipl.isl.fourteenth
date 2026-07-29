@@ -2177,6 +2177,80 @@ def _promote_all_impl(volumes: list[int] | None) -> dict:
     return {"persons": persons_result, "places": places_result}
 
 
+def bulk_insert_ocr_flags(rows: list[dict]) -> int:
+    """Idempotent: match-level rows (char_start IS NOT NULL) are protected by
+    ix_ocr_flags_dedup, so INSERT OR IGNORE never duplicates a row for the
+    same (volume, sequence, heuristic, span). density_outlier rows have a
+    NULL char_start/char_end, which SQLite's UNIQUE index treats as always
+    distinct (see schema.sql), so those are deduped here instead via an
+    explicit pre-check. Returns the number of rows actually inserted, so a
+    re-run of 01c_flag_ocr_for_review.py can report "0 new" on repeat runs."""
+    conn = get_connection()
+    inserted = 0
+    try:
+        with conn:
+            for r in rows:
+                if r.get("char_start") is None:
+                    existing = conn.execute(
+                        "SELECT 1 FROM ocr_flags WHERE volume = ? AND sequence = ? AND heuristic = ?",
+                        (r["volume"], r["sequence"], r["heuristic"]),
+                    ).fetchone()
+                    if existing:
+                        continue
+                cur = conn.execute(
+                    """INSERT OR IGNORE INTO ocr_flags
+                       (volume, sequence, heuristic, char_start, char_end, matched_text, shape,
+                        excerpt, excerpt_offset, page_start, segment_length,
+                        metric_value, metric_reference, detail, suspicion_score)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (r["volume"], r["sequence"], r["heuristic"], r.get("char_start"), r.get("char_end"),
+                     r.get("matched_text", ""), r.get("shape", ""), r.get("excerpt", ""),
+                     r.get("excerpt_offset", 0), r["page_start"], r["segment_length"],
+                     r.get("metric_value"), r.get("metric_reference"), r.get("detail", ""),
+                     r.get("suspicion_score", 0)),
+                )
+                inserted += cur.rowcount
+    finally:
+        conn.close()
+    return inserted
+
+
+def get_ocr_flags(volume: int | None = None, status: str | None = "open") -> pd.DataFrame:
+    conn = get_connection()
+    try:
+        q = "SELECT * FROM ocr_flags WHERE 1=1"
+        params = []
+        if volume is not None:
+            q += " AND volume = ?"; params.append(volume)
+        if status is not None:
+            q += " AND status = ?"; params.append(status)
+        q += " ORDER BY suspicion_score DESC, ocr_flag_pk"
+        return pd.read_sql_query(q, conn, params=params)
+    finally:
+        conn.close()
+
+
+def set_ocr_flag_decision(ocr_flag_pk: int, status: str, human_correction: str = "") -> dict:
+    """One-phase, unlike review_item's set_review_decision + _apply_review_decision_impl
+    split -- an OCR correction has no downstream relational table to touch
+    (no person_pk/place_pk to relink), so recording the decision IS the whole
+    operation. Not wrapped in with_undo(): that's reserved for multi-table,
+    hard-to-reverse operations (merges, promotions), not simple single-row
+    status writes -- matching set_review_decision/record_person_duplicate_decision,
+    neither of which is snapshotted either."""
+    conn = get_connection()
+    try:
+        with conn:
+            conn.execute(
+                """UPDATE ocr_flags SET status = ?, human_correction = ?, decided_at = datetime('now')
+                   WHERE ocr_flag_pk = ?""",
+                (status, human_correction, ocr_flag_pk),
+            )
+        return {"ocr_flag_pk": ocr_flag_pk, "status": status}
+    finally:
+        conn.close()
+
+
 def promote_all(volumes: list[int] | None = None) -> dict:
     """Recomputes eligibility itself at the moment of promotion (never
     trusts a possibly-stale list handed in from the UI) -- the hard-block

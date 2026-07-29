@@ -84,6 +84,18 @@ def char_diff_spans(a: str, b: str) -> tuple[str, str]:
     return "".join(a_out), "".join(b_out)
 
 
+def render_highlighted_span(text: str, start: int, end: int, css_class: str = "diff-add") -> str:
+    """Highlights one known [start:end) span within a single string -- for
+    when there's no "other side" to diff against, just a known offset to
+    point at (e.g. an OCR-quality flag's matched_text within its excerpt).
+    Sibling to char_diff_spans, not built on it: that function diffs TWO
+    strings; this highlights a span in ONE. Uses "diff-add" (green) by
+    default, not "diff-del" (which includes text-decoration: line-through,
+    wrongly implying deletion) -- this is a pointer, not a proposed removal."""
+    return (f'{html.escape(text[:start])}<mark class="{css_class}">'
+            f'{html.escape(text[start:end])}</mark>{html.escape(text[end:])}')
+
+
 def render_diff_row(label: str, left_val: str, right_val: str,
                      left_col=None, mid_col=None, right_col=None) -> None:
     """Renders one label + two diffed values in a 3-column layout (label /

@@ -472,7 +472,7 @@ def page_pipeline():
 _QUEUE_TYPE_LABELS = {
     "new_person": "New person", "new_place": "New place",
     "person_dup": "Person duplicate", "place_dup": "Place duplicate",
-    "review_item": "Review queue item",
+    "review_item": "Review queue item", "ocr_fix": "OCR quality fix",
 }
 
 
