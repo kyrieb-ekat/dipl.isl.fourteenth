@@ -21,6 +21,14 @@ SEGMENTS_DIR = OUTPUT_DIR / "segments"   # one .txt per charter
 ENTITIES_DIR = OUTPUT_DIR / "entities"  # raw JSON from Claude API
 REVIEW_DIR   = OUTPUT_DIR / "review"    # per-volume CSVs for manual review
 
+# OCR-correction output (01b_apply_ocr_corrections.py) -- deliberately a
+# separate tree, never the live SEGMENTS_DIR, so correcting already-processed
+# volumes' text can never silently collide with their already-extracted/
+# resolved/reviewed data. There's no ENTITIES_CORRECTED_DIR counterpart:
+# 02_extract_entities.py's --output takes an arbitrary path for corrected
+# re-extraction (see its docstring), so no fixed constant is needed for it.
+SEGMENTS_CORRECTED_DIR = OUTPUT_DIR / "segments_corrected"
+
 # Authority file (read-only during extraction; updated only by 06_merge_into_xlsx.py)
 # Override via AUTHORITY_FILE in .env — see note on PDF_DIR above.
 AUTHORITY_FILE = Path(os.environ.get(
